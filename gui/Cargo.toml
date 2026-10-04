@@ -1,0 +1,40 @@
+[package]
+name = "xlang-gui"
+version = "0.1.0"
+edition = "2024"
+
+# GUI 版解释器：与根包共享 src/main.rs（include!），仅多出 egui/eframe。
+# 编译产物：xlang_gui.exe。根包 xlang.exe 完全不含 GUI，互不拖性能。
+
+[[bin]]
+name = "xlang_gui"
+path = "src/main.rs"
+
+[features]
+# main.rs 里所有 GUI 代码都用 #[cfg(feature = "gui")] 门控，这里常开
+default = ["gui"]
+gui = []
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+percent-encoding = "2.3"
+ariadne = "0.4"
+ahash = "0.8"
+mimalloc = "0.1"
+yansi = "1"
+
+[dependencies.eframe]
+version = "0.31"
+default-features = false
+features = ["glow", "default_fonts"]
+
+[dependencies.egui]
+version = "0.31"
+
+[lints.rust]
+dead_code = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+unused_unsafe = "allow"
+static_mut_refs = "allow"
+non_snake_case = "allow"
