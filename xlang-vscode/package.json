@@ -1,0 +1,113 @@
+{
+  "name": "xlang-language",
+  "displayName": "XLang Language Support",
+  "description": "完整的 XLang 语言支持：语法高亮、代码片段、运行/类型检查脚本、HTTP 服务器等命令。",
+  "version": "0.1.0",
+  "publisher": "xlang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:xlang"
+  ],
+  "main": "./client/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "xlang",
+        "aliases": [
+          "XLang",
+          "xlang",
+          "X"
+        ],
+        "extensions": [
+          ".x"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "xlang",
+        "scopeName": "source.xlang",
+        "path": "./syntaxes/xlang.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "xlang",
+        "path": "./snippets/xlang.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "xlang.run",
+        "title": "XLang: 运行当前脚本"
+      },
+      {
+        "command": "xlang.runSilent",
+        "title": "XLang: 运行当前脚本（静默，无提示）"
+      },
+      {
+        "command": "xlang.typecheck",
+        "title": "XLang: 静态类型检查当前脚本"
+      },
+      {
+        "command": "xlang.version",
+        "title": "XLang: 显示版本"
+      },
+      {
+        "command": "xlang.listStd",
+        "title": "XLang: 列出标准库（自动识别 std）"
+      }
+    ],
+    "configuration": {
+      "title": "XLang",
+      "properties": {
+        "xlang.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "xlang.exe 的绝对路径；留空则自动查找 PATH 中的 xlang.exe"
+        },
+        "xlang.runInTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "运行脚本时在集成终端中输出（支持 input() 交互）；关闭则在通知中显示结果"
+        },
+        "xlang.cleanOnRun": {
+          "type": "boolean",
+          "default": true,
+          "description": "运行脚本时附加 --clean=true（跳过 clean 编译缓存）；设为 false 则按 xlang 默认行为运行"
+        }
+      }
+    },
+    "menus": {
+      "editor/title/context": [
+        {
+          "command": "xlang.run",
+          "when": "editorLangId == xlang",
+          "group": "navigation@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "xlang.run",
+          "when": "resourceLangId == xlang",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "xlang.run",
+        "key": "ctrl+f5",
+        "when": "editorLangId == xlang && !editorHasSelection"
+      }
+    ]
+  }
+}

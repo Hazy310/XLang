@@ -1,0 +1,256 @@
+{
+  "$schema": "./schema/tmlanguage.json",
+  "name": "XLang",
+  "scopeName": "source.xlang",
+  "fileTypes": [
+    "x"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#function-def"
+    },
+    {
+      "include": "#class-def"
+    },
+    {
+      "include": "#import-stmt"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#identifiers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.xlang",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.xlang",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.raw.xlang",
+          "begin": "r\"",
+          "end": "\""
+        },
+        {
+          "name": "string.quoted.double.xlang",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.xlang",
+              "match": "\\\\.|\\$\\$"
+            },
+            {
+              "include": "#interpolation"
+            }
+          ]
+        }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.interpolation.xlang",
+      "begin": "\\$\\{",
+      "end": "\\}",
+      "patterns": [
+        {
+          "include": "#numbers"
+        },
+        {
+          "include": "#builtins"
+        },
+        {
+          "include": "#operators"
+        },
+        {
+          "include": "#identifiers"
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.xlang",
+      "match": "\\b(?:0[xX][0-9a-fA-F]+|\\d+\\.\\d+|\\d+)\\b"
+    },
+    "function-def": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(",
+          "captures": {
+            "1": {
+              "name": "storage.type.xlang"
+            },
+            "2": {
+              "name": "entity.name.function.xlang"
+            }
+          }
+        },
+        {
+          "match": "\\b(fn)\\s*\\(",
+          "captures": {
+            "1": {
+              "name": "storage.type.xlang"
+            }
+          }
+        }
+      ]
+    },
+    "class-def": {
+      "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
+      "captures": {
+        "1": {
+          "name": "storage.type.xlang"
+        },
+        "2": {
+          "name": "entity.name.type.class.xlang"
+        },
+        "3": {
+          "name": "entity.name.type.inherited.xlang"
+        }
+      }
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.xlang",
+          "match": "\\b(?:if|elif|else|while|for|in|from|to|return|break|continue|throw|try|catch|match|and|or|import)\\b"
+        },
+        {
+          "name": "storage.type.xlang",
+          "match": "\\b(?:let|const|fn|class|static|unsafe|i32|i64|float|f64|double|str|string|bool|void)\\b"
+        },
+        {
+          "name": "constant.language.boolean.xlang",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "variable.language.self.xlang",
+          "match": "\\b(?:self|super)\\b"
+        },
+        {
+          "name": "entity.name.function.constructor.xlang",
+          "match": "\\bnew\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.xlang",
+          "match": "\\byield\\b"
+        },
+        {
+          "name": "support.function.builtin.xlang",
+          "match": "\\b(?:print|printnowrap|printnw|input|len|substr|index_of|split_str|str_to_num|to_int|to_float|to_str|version|read_file|write_file|append_file|read_lines|file_line_count|read_line_at|file_truncate|edit_line|append_line|append_at_line|file_exists|delete_file|http_server|exit|map|filter|reduce|join|sort)\\b"
+        },
+        {
+          "name": "support.function.gui.xlang",
+          "match": "\\bgui_[A-Za-z_][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "support.function.gui.xlang",
+          "match": "\\bcanvas_[A-Za-z_][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "support.function.gui.xlang",
+          "match": "\\bquit\\b"
+        }
+      ]
+    },
+    "operators": {
+      "name": "keyword.operator.xlang",
+      "match": "->|==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|\\+\\+|--|[-+*/%=<>!&|^~?:]"
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.other.private.xlang",
+          "match": "#[A-Za-z_][A-Za-z0-9_]*"
+        },
+        {
+          "name": "meta.method-call.xlang",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.xlang"
+            }
+          }
+        },
+        {
+          "name": "variable.other.xlang",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "import-stmt": {
+      "patterns": [
+        {
+          "match": "\\b(import)\\s+([A-Za-z_*][A-Za-z0-9_.:]*)(?:\\{\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?:,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?:,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?:,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?:,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?:,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*)*)?)?)?)?)?",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.xlang"
+            },
+            "2": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "3": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "4": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "5": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "6": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "7": {
+              "name": "entity.name.type.class.xlang"
+            },
+            "8": {
+              "name": "entity.name.type.class.xlang"
+            }
+          }
+        },
+        {
+          "name": "entity.name.type.class.xlang",
+          "match": "\\b(?:std|lib)\\s*(?:(?:\\.|::)\\s*[A-Za-z_*][A-Za-z0-9_.:]*)+"
+        },
+        {
+          "name": "keyword.control.import.as.xlang",
+          "match": "\\bas\\b"
+        },
+        {
+          "name": "string.quoted.double.xlang",
+          "match": "\"[^\"]*\""
+        }
+      ]
+    }
+  }
+}

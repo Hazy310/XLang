@@ -1,0 +1,242 @@
+{
+  "print": {
+    "prefix": "print",
+    "body": [
+      "print(${1:expr});"
+    ],
+    "description": "print 输出"
+  },
+  "printnw": {
+    "prefix": "printnw",
+    "body": [
+      "printnowrap(${1:expr});"
+    ],
+    "description": "print 不换行"
+  },
+  "let": {
+    "prefix": "let",
+    "body": [
+      "let ${1:name} = ${2:value};"
+    ],
+    "description": "变量定义"
+  },
+  "const": {
+    "prefix": "const",
+    "body": [
+      "const ${1:name} = ${2:value};"
+    ],
+    "description": "常量定义"
+  },
+  "if": {
+    "prefix": "if",
+    "body": [
+      "if ${1:cond} {",
+      "\t${2:body}",
+      "}"
+    ],
+    "description": "if 语句"
+  },
+  "ifelse": {
+    "prefix": "ife",
+    "body": [
+      "if ${1:cond} {",
+      "\t${2:body}",
+      "} else {",
+      "\t${3:else_body}",
+      "}"
+    ],
+    "description": "if-else"
+  },
+  "while": {
+    "prefix": "while",
+    "body": [
+      "while ${1:cond} {",
+      "\t${2:body}",
+      "}"
+    ],
+    "description": "while 循环"
+  },
+  "for": {
+    "prefix": "for",
+    "body": [
+      "for ${1:i} in ${2:0}..${3:10} {",
+      "\t${4:body}",
+      "}"
+    ],
+    "description": "for 区间循环"
+  },
+  "forfrom": {
+    "prefix": "forf",
+    "body": [
+      "for ${1:i} from ${2:0} to ${3:10} {",
+      "\t${4:body}",
+      "}"
+    ],
+    "description": "for from/to"
+  },
+  "fn": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:params}) {",
+      "\t${3:body}",
+      "}"
+    ],
+    "description": "函数定义"
+  },
+  "lamb": {
+    "prefix": "lam",
+    "body": [
+      "fn(${1:x}) { ${2:body} }"
+    ],
+    "description": "闭包 / 匿名函数"
+  },
+  "class": {
+    "prefix": "class",
+    "body": [
+      "class ${1:Name} {",
+      "\tlet ${2:field};",
+      "\tfn new(${3:self}, ${4:args}) {",
+      "\t\t${5:body}",
+      "\t}",
+      "}"
+    ],
+    "description": "类定义"
+  },
+  "classinherit": {
+    "prefix": "classi",
+    "body": [
+      "class ${1:Child} : ${2:Parent} {",
+      "\tfn new(${3:self}, ${4:args}) {",
+      "\t\tsuper(${5:args});",
+      "\t\t${6:body}",
+      "\t}",
+      "}"
+    ],
+    "description": "类继承"
+  },
+  "staticfn": {
+    "prefix": "staticfn",
+    "body": [
+      "static fn ${1:name}(${2:params}) {",
+      "\t${3:body}",
+      "}"
+    ],
+    "description": "静态方法"
+  },
+  "method": {
+    "prefix": "method",
+    "body": [
+      "fn ${1:name}(${2:self}) {",
+      "\t${3:body}",
+      "}"
+    ],
+    "description": "实例方法"
+  },
+  "dict": {
+    "prefix": "dict",
+    "body": [
+      "{ \"${1:key}\": ${2:value} }"
+    ],
+    "description": "字典字面量"
+  },
+  "match": {
+    "prefix": "match",
+    "body": [
+      "let r = match ${1:z} {",
+      "\t${2:1}..${3:10} => ${4:value},",
+      "\t_ => ${5:default}",
+      "};"
+    ],
+    "description": "match 模式匹配"
+  },
+  "import": {
+    "prefix": "import",
+    "body": [
+      "import ${1:std.math};"
+    ],
+    "description": "导入模块（新语法，无引号点链）"
+  },
+  "try": {
+    "prefix": "try",
+    "body": [
+      "try {",
+      "\t${1:body}",
+      "} catch ${2:e} {",
+      "\t${3:handle}",
+      "}"
+    ],
+    "description": "异常处理"
+  },
+  "throw": {
+    "prefix": "throw",
+    "body": [
+      "throw \"${1:msg}\";"
+    ],
+    "description": "抛出异常"
+  },
+  "guiapp": {
+    "prefix": "gui_window",
+    "body": [
+      "gui_window(\"${1:标题}\", ${2:800}.0, ${3:600}.0, fn() {",
+      "\t${4:body}",
+      "});"
+    ],
+    "description": "GUI 窗口"
+  },
+  "guibutton": {
+    "prefix": "gui_button",
+    "body": [
+      "gui_button(\"${1:标签}\", fn() { ${2:body} }, ${3:36}.0);"
+    ],
+    "description": "GUI 按钮"
+  },
+  "guiinput": {
+    "prefix": "gui_input_var",
+    "body": [
+      "gui_input_var(\"${1:标签}\", \"${2:var}\");"
+    ],
+    "description": "GUI 输入框"
+  },
+  "guioutput": {
+    "prefix": "gui_output",
+    "body": [
+      "gui_output(\"${1:var}\");"
+    ],
+    "description": "GUI 只读输出"
+  },
+  "guitable": {
+    "prefix": "gui_table",
+    "body": [
+      "gui_table([${1:cols}], ${2:rows}, fn(${3:ri}) { ${4:body} });"
+    ],
+    "description": "GUI 表格"
+  },
+  "guirun": {
+    "prefix": "gui_run",
+    "body": [
+      "gui_run(\"${1:cmd}\", \"${2:input}\", \"${3:outvar}\");"
+    ],
+    "description": "异步运行命令"
+  },
+  "map": {
+    "prefix": "map",
+    "body": [
+      "map(${1:arr}, fn(${2:x}) { ${3:body} })"
+    ],
+    "description": "数组 map"
+  },
+  "filter": {
+    "prefix": "filter",
+    "body": [
+      "filter(${1:arr}, fn(${2:x}) { ${3:cond} })"
+    ],
+    "description": "数组 filter"
+  },
+  "reduce": {
+    "prefix": "reduce",
+    "body": [
+      "reduce(${1:arr}, fn(${2:acc}, ${3:x}) { ${4:body} }, ${5:init})"
+    ],
+    "description": "数组 reduce"
+  }
+}

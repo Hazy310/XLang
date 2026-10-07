@@ -26,11 +26,6 @@ use std::path::{Path, PathBuf};
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use ahash::{HashMap as FastMap, HashMapExt};
 
-fn format_f64(v:f64, digits:i32) -> f64{
-    let mul = 10_f64.powi(digits);
-    (v * mul).round() / mul
-}
-
 // 自定义错误：携带 脚本文件名、行号、错误文本
 #[derive(Debug)]
 struct ScriptError {
@@ -38,6 +33,8 @@ struct ScriptError {
     line: u32,
     col: u32,
     msg: String,
+    /// 附加定位（根源/连带位置）：(line, col, msg)，渲染为次要黄色标签
+    secondary: Vec<(u32, u32, String)>,
 }
 
 #[derive(Debug)]
@@ -412,6 +409,7 @@ enum Token {
     In,
     Unsafe,
     Return,
+    Yield,
     Break,
     Continue,
     Throw,
@@ -425,9 +423,11 @@ enum Token {
     OrKey,
     Match,
     Arrow,
+    ArrowR, // -> 类型转换 / 函数返回类型标注
     Underscore,
     Ident(String),
     Number(i32),
+    Int64(i64), // 超出 i32 范围的整数字面量
     Float(f64),
     String(String),
     RawString(String),
@@ -447,6 +447,7 @@ enum Token {
     Le, // <=
     QuestionEqual, // ?=
     Neq, // != 不等于
+    Not, // ! 逻辑非
     LParen,
     RParen,
     LBrace,
@@ -598,7 +599,8 @@ impl Tokenizer {
                     self.pos += 2;
                     return Token::Neq;
                 } else {
-                    script_panic_at(file, *line, self.current_col(), "单独 ! 不支持，仅支持 != 不等于运算符");
+                    self.pos += 1;
+                    return Token::Not;
                 }
             }
             '=' => {
@@ -613,7 +615,18 @@ impl Tokenizer {
                 }
             }
             '+' => self.consume(Token::Plus),
-            '-' => self.consume(Token::Minus),
+            '-' => {
+                let save = self.pos;
+                let mut p = self.pos + 1;
+                while p < self.chars.len() && self.chars[p].is_whitespace() { p += 1; }
+                if p < self.chars.len() && self.chars[p] == '>' {
+                    self.pos = p + 1;
+                    Token::ArrowR
+                } else {
+                    self.pos = save;
+                    self.consume(Token::Minus)
+                }
+            }
             '/' => {
                 if self.peek() == '/' {
                     self.skip_line_comment(line);
@@ -710,7 +723,10 @@ impl Tokenizer {
         } else {
             match num_str.parse::<i32>() {
                 Ok(n) => Token::Number(n),
-                Err(_) => script_panic_at(file, *line, start_col, &format!("整数解析失败: {}", num_str)),
+                Err(_) => match num_str.parse::<i64>() {
+                    Ok(n) => Token::Int64(n),
+                    Err(_) => script_panic_at(file, *line, start_col, &format!("整数解析失败: {}", num_str)),
+                },
             }
         }
     }
@@ -792,6 +808,7 @@ impl Tokenizer {
             "from" => Token::From,
             "to" => Token::To,
             "unsafe" => Token::Unsafe,
+            "yield" => Token::Yield,
             "return" => Token::Return,
             "break" => Token::Break,
             "continue" => Token::Continue,
@@ -853,8 +870,12 @@ impl Tokenizer {
 // ==============================
 #[derive(Debug, Clone)]
 struct Func {
+    name: String,
+    line: u32,
     params: Vec<String>,
     body: Vec<Stmt>,
+    /// 返回类型标注（fn f() -> i64），None 表示未标注
+    ret_ty: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -872,6 +893,7 @@ struct ClassDef {
 #[derive(Debug, Clone)]
 enum Expr {
     Number(i32, u32),
+    Int64(i64, u32),
     Float(f64, u32),
     String(String, u32),
     RawString(String, u32),
@@ -888,6 +910,7 @@ enum Expr {
     Deref(Box<Expr>, u32),
     DerefAssign(Box<Expr>, Box<Expr>, u32),
     Neg(Box<Expr>, u32),
+    Not(Box<Expr>, u32),
     Member(Box<Expr>, u32, u32), // expr . ident
     MethodCall(Box<Expr>, u32, Vec<Expr>, u32), // obj.method(args)
     MemberAssign(Box<Expr>, u32, Box<Expr>, u32),
@@ -903,6 +926,8 @@ enum Expr {
     Match(Box<Expr>, Vec<(MatchPat, Expr)>, u32),
     // 区间表达式：lo..hi（数值区间值）
     Range(Box<Expr>, Box<Expr>, u32),
+    // 类型转换：expr -> i32/i64/float/str/bool
+    Cast(Box<Expr>, String, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -992,13 +1017,14 @@ impl TypeEnv {
 enum Stmt {
     Let(u32, Expr, u32),
     Const(u32, Expr, u32),
-    FnDef(String, Vec<String>, Vec<Stmt>, u32),
+    FnDef(String, Vec<String>, Vec<Stmt>, Option<String>, u32),
     If(Expr, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>, Vec<Stmt>, u32),
     While(Expr, Vec<Stmt>, u32),
     For(u32, Expr, Expr, Vec<Stmt>, u32),
     Print(Vec<Expr>, u32),
     Expr(Expr, u32),
     Return(Option<Expr>, u32),
+    Yield(Expr, u32),
     Break(u32),
     Continue(u32),
     /// throw 表达式：抛出异常值
@@ -1010,6 +1036,7 @@ enum Stmt {
         parts: Vec<String>,
         alias: Option<String>,
         import_all: bool,
+        names: Option<Vec<String>>,
         line: u32,
     },
     UnsafeBlock(Vec<Stmt>, u32),
@@ -1028,6 +1055,8 @@ struct Parser {
     // 新增：全局类型检查环境，贯穿整个文件解析
     type_env: TypeEnv,
     in_unsafe_block: bool,
+    /// 已知模块命名空间（如 "std"、"std::math"、"math"），点链命中时按命名空间访问
+    known_modules: HashSet<String>,
 }
 
 impl Parser {
@@ -1035,7 +1064,7 @@ impl Parser {
         let mut line = 1;
         // 初始化读取首个 token，同步行号
         let current = tokenizer.next_token("", &mut line);
-        Self {
+        let mut p = Self {
             tokenizer,
             current,
             const_names: HashSet::new(),
@@ -1043,7 +1072,11 @@ impl Parser {
             file: String::new(),
             type_env: TypeEnv::new(), // 初始化全局类型环境
             in_unsafe_block: false,
-        }
+            known_modules: HashSet::new(),
+        };
+        p.known_modules.insert("std".to_string());
+        p.known_modules.insert("lib".to_string());
+        p
     }
 
     fn parse_program(&mut self) -> Vec<Stmt> {
@@ -1069,6 +1102,7 @@ impl Parser {
             Token::For => self.parse_for(),
             Token::Unsafe => self.parse_unsafe_block(),
             Token::Return => self.parse_return(),
+            Token::Yield => self.parse_yield(),
             Token::Try => self.parse_try(),
             Token::Throw => self.parse_throw(),
             Token::Ident(name) if name == "print" => self.parse_print(),
@@ -1103,7 +1137,8 @@ impl Parser {
                     start_expr = *l;
                     end_expr = *r;
                 } else {
-                    self.panic_here( "in 后面必须使用区间符号 ..");
+                    // 单值源：for x in gen() / for x in arr，end 用哨兵 0，求值按 start 类型分派
+                    end_expr = Expr::Number(0, self.line);
                 }
             }
             Token::From => {
@@ -1218,6 +1253,14 @@ impl Parser {
         Stmt::Return(ret_expr, self.line)
     }
 
+    fn parse_yield(&mut self) -> Stmt {
+        self.consume(Token::Yield);
+        let ln = self.line; // yield 关键字所在行（后续 consume 分号会推进行号）
+        let expr = self.parse_expr();
+        self.consume(Token::Semicolon);
+        Stmt::Yield(expr, ln)
+    }
+
     fn parse_break(&mut self) -> Stmt {
         self.consume(Token::Break);
         self.consume(Token::Semicolon);
@@ -1246,14 +1289,31 @@ impl Parser {
 
     fn parse_import(&mut self) -> Stmt {
         self.consume(Token::Import);
-        let path_raw = match &self.current {
-            Token::String(s) => s.clone(),
-            _ => self.panic_here( "import 后必须跟字符串路径")
-        };
-        self.consume(Token::String(path_raw.clone()));
-
-        // 剥离字符串里的 ||LINE|| 行号后缀，得到纯净的模块路径
-        let path_str = path_raw.split("||LINE||").next().unwrap_or("").to_string();
+        let mut path_str = String::new();
+        // 新语法：import std.math.x; / import std.math.*; / import std.*;（. 或 :: 分隔，可含 * 通配）
+        // 兼容旧语法：import "math" / import "std::math"（字符串，仍支持）
+        if let Token::String(s) = &self.current {
+            path_str = s.split("||LINE||").next().unwrap_or("").to_string();
+            self.consume(Token::String(s.clone()));
+        } else {
+            loop {
+                match &self.current {
+                    Token::Ident(n) => { path_str.push_str(n); self.consume(Token::Ident(n.clone())); }
+                    Token::Star => { path_str.push('*'); self.consume(Token::Star); }
+                    _ => break,
+                }
+                if matches!(self.current, Token::Dot) {
+                    path_str.push('.'); self.consume(Token::Dot);
+                } else if matches!(self.current, Token::ColonColon) {
+                    path_str.push_str("::"); self.consume(Token::ColonColon);
+                } else {
+                    break;
+                }
+            }
+            if path_str.is_empty() {
+                self.panic_here("import 后必须跟模块路径（如 std.math / std.math.*）");
+            }
+        }
 
         let mut alias: Option<String> = None;
         if let Token::Ident(word) = &self.current {
@@ -1267,14 +1327,60 @@ impl Parser {
                 alias = Some(a);
             }
         }
+        // 命名导入：import mod.{func1, constA};（花括号符号列表，不支持 as）
+        let mut names: Option<Vec<String>> = None;
+        if self.current == Token::LBrace {
+            if alias.is_some() { self.panic_here("命名导入（{ }）不支持与 as 同时使用"); }
+            self.consume(Token::LBrace);
+            let mut list = Vec::new();
+            loop {
+                let n = match &self.current {
+                    Token::Ident(s) => s.clone(),
+                    _ => self.panic_here("import { } 内必须是标识符"),
+                };
+                self.consume(Token::Ident(n.clone()));
+                list.push(n);
+                match self.current {
+                    Token::Comma => { self.consume(Token::Comma); }
+                    Token::RBrace => { self.consume(Token::RBrace); break; }
+                    _ => self.panic_here("import { } 内需用逗号分隔，并以 } 结束"),
+                }
+            }
+            if list.is_empty() { self.panic_here("import { } 内不能为空"); }
+            if let Token::Ident(w) = &self.current { if w == "as" { self.panic_here("命名导入（{ }）不支持 as"); } }
+            names = Some(list);
+        }
         self.consume(Token::Semicolon);
-        let path_parts: Vec<String> = path_str.split("::").map(|s| s.to_string()).collect();
+        // 归一化：:: → .，再按 . 拆分（过滤空），保留 * 通配标记
+        let normalized = path_str.replace("::", ".").replace("||LINE||", "");
+        let parts: Vec<String> = normalized.split('.')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_string())
+            .collect();
+        let import_all = parts.iter().any(|seg| seg == "*");
+        // 记住模块路径各级前缀，使点链命名空间访问（std.math.PI）可解析
+        let mut acc = Vec::new();
+        for seg in &parts {
+            if seg == "*" { break; }
+            acc.push(seg.clone());
+            self.known_modules.insert(acc.join("::"));
+        }
+        // std 前缀模块同时记住无前缀别名（std::math -> math），使 math.PI 也可用
+        if parts.first().map(|x| x.as_str()) == Some("std") {
+            let mut acc2 = Vec::new();
+            for seg in &parts[1..] {
+                if seg == "*" { break; }
+                acc2.push(seg.clone());
+                self.known_modules.insert(acc2.join("::"));
+            }
+        }
         Stmt::ImportItem {
             lib_path: path_str,
-            parts: path_parts,
+            parts,
             alias,
-            import_all: false,
-            line: self.line, 
+            import_all,
+            names,
+            line: self.line,
         }
     }
 
@@ -1285,9 +1391,23 @@ impl Parser {
             _ => self.panic_here( "语法错误：期望参数名")
         };
         self.consume(Token::Ident(name.clone()));
+        // 类型标注：let a: i32 = expr
+        let mut ty: Option<String> = None;
+        if matches!(self.current, Token::Colon) {
+            self.consume(Token::Colon);
+            ty = Some(match &self.current {
+                Token::Ident(t) => t.clone(),
+                _ => self.panic_here( "语法错误：类型标注需要类型名"),
+            });
+            self.consume(Token::Ident(ty.clone().unwrap()));
+        }
         self.consume(Token::Eq);
         let expr = self.parse_expr();
         self.consume(Token::Semicolon);
+        let expr = match ty {
+            Some(t) => Expr::Cast(Box::new(expr), t, self.line),
+            None => expr,
+        };
         Stmt::Let(interner().get(&name), expr, self.line)
     }
 
@@ -1304,6 +1424,7 @@ impl Parser {
             }
             return Stmt::Expr(lambda, line);
         }
+        let fn_start_line = self.line; // fn 关键字所在行（后续 consume 会推进到函数结束行）
         let name = match &self.current {
             Token::Ident(n) => n.clone(),
             _ => self.panic_here( "语法错误：期望函数名")
@@ -1336,6 +1457,16 @@ impl Parser {
             }
         }
         self.consume(Token::RParen);
+        // 返回类型标注：fn f() -> i64
+        let ret_ty: Option<String> = if matches!(self.current, Token::ArrowR) {
+            self.consume(Token::ArrowR);
+            let t = match &self.current {
+                Token::Ident(s) => s.clone(),
+                _ => self.panic_here( "语法错误：-> 后需要返回类型"),
+            };
+            self.consume(Token::Ident(t.clone()));
+            Some(t)
+        } else { None };
         self.consume(Token::LBrace);
 
         let mut body = Vec::new();
@@ -1346,7 +1477,7 @@ impl Parser {
 
         // 函数解析完毕，恢复外层全局类型环境
         self.type_env = outer_env;
-        Stmt::FnDef(name, params, body, self.line)
+        Stmt::FnDef(name, params, body, ret_ty, fn_start_line)
     }
 
     /// 匿名函数字面量（闭包）：fn(params) { body }
@@ -1386,7 +1517,7 @@ impl Parser {
         }
         self.consume(Token::RBrace);
         self.type_env = outer_env;
-        Expr::Lambda(Func { params, body }, line)
+        Expr::Lambda(Func { name: "<lambda>".into(), line, params, body, ret_ty: None }, line)
     }
 
     /// 字典字面量：{ "k": expr, "k2": expr, ... }，键为字符串或标识符
@@ -1457,18 +1588,35 @@ impl Parser {
         while self.current != Token::RBrace && self.current != Token::Eof {
             match &self.current {
                 Token::Let => {
-                    // 字段占位声明：let name;
+                    // 字段声明：let name;（公开）或 let #name;（私有，推荐）
                     self.consume(Token::Let);
+                    let is_private = matches!(self.current, Token::Hash);
+                    if is_private {
+                        self.consume(Token::Hash);
+                    }
                     let fname = match &self.current {
                         Token::Ident(s) => s.clone(),
                         _ => self.panic_here("语法错误：期望字段名"),
                     };
                     self.consume(Token::Ident(fname.clone()));
+                    // 可选字段类型标注：let name: str;
+                    if matches!(self.current, Token::Colon) {
+                        self.consume(Token::Colon);
+                        let _t = match &self.current {
+                            Token::Ident(s) => s.clone(),
+                            _ => self.panic_here("语法错误：字段类型标注需要类型名"),
+                        };
+                        self.consume(Token::Ident(_t.clone()));
+                    }
                     self.consume(Token::Semicolon);
-                    fields.push(interner().get(&fname));
+                    if is_private {
+                        private_fields.push(interner().get(&fname));
+                    } else {
+                        fields.push(interner().get(&fname));
+                    }
                 }
                 Token::Hash => {
-                    // 私有字段声明：#let password;
+                    // 旧私有字段语法兼容：#let password;
                     self.consume(Token::Hash);
                     if !matches!(self.current, Token::Let) {
                         self.panic_here("# 后必须跟 let 声明私有字段");
@@ -1479,6 +1627,15 @@ impl Parser {
                         _ => self.panic_here("语法错误：期望字段名"),
                     };
                     self.consume(Token::Ident(fname.clone()));
+                    // 可选字段类型标注：#let name: str;
+                    if matches!(self.current, Token::Colon) {
+                        self.consume(Token::Colon);
+                        let _t = match &self.current {
+                            Token::Ident(s) => s.clone(),
+                            _ => self.panic_here("语法错误：字段类型标注需要类型名"),
+                        };
+                        self.consume(Token::Ident(_t.clone()));
+                    }
                     self.consume(Token::Semicolon);
                     private_fields.push(interner().get(&fname));
                 }
@@ -1488,15 +1645,15 @@ impl Parser {
                     if !matches!(self.current, Token::Fn) {
                         self.panic_here("static 后必须跟 fn 方法定义");
                     }
-                    let (mname, params, body) = self.parse_class_method();
-                    statics.insert(interner().get(&mname), Func { params, body });
+                    let (mname, params, body, ret_ty) = self.parse_class_method();
+                    statics.insert(interner().get(&mname), Func { name: mname.clone(), line: self.line, params, body, ret_ty });
                 }
                 Token::Fn => {
-                    let (mname, params, body) = self.parse_class_method();
-                    if mname == "new" {
-                        constructor = Some(Func { params, body });
+                    let (mname, params, body, ret_ty) = self.parse_class_method();
+                    if mname == "new" || mname == "init" {
+                        constructor = Some(Func { name: "new".into(), line: self.line, params, body, ret_ty });
                     } else {
-                        methods.insert(interner().get(&mname), Func { params, body });
+                        methods.insert(interner().get(&mname), Func { name: mname.clone(), line: self.line, params, body, ret_ty });
                     }
                 }
                 _ => self.panic_here("类体内仅支持字段声明 let x; / fn 方法 / static fn 静态方法"),
@@ -1507,7 +1664,7 @@ impl Parser {
     }
 
     /// 解析类内方法定义：fn 名(参数...) { 体 }，返回 (方法名, 参数, 函数体)
-    fn parse_class_method(&mut self) -> (String, Vec<String>, Vec<Stmt>) {
+    fn parse_class_method(&mut self) -> (String, Vec<String>, Vec<Stmt>, Option<String>) {
         self.consume(Token::Fn);
         let name = match &self.current {
             Token::Ident(n) => n.clone(),
@@ -1532,13 +1689,23 @@ impl Parser {
             }
         }
         self.consume(Token::RParen);
+        // 返回类型标注：fn m() -> type
+        let ret_ty: Option<String> = if matches!(self.current, Token::ArrowR) {
+            self.consume(Token::ArrowR);
+            let t = match &self.current {
+                Token::Ident(s) => s.clone(),
+                _ => self.panic_here("语法错误：-> 后需要返回类型"),
+            };
+            self.consume(Token::Ident(t.clone()));
+            Some(t)
+        } else { None };
         self.consume(Token::LBrace);
         let mut body = Vec::new();
         while !matches!(self.current, Token::RBrace) {
             body.push(self.parse_stmt());
         }
         self.consume(Token::RBrace);
-        (name, params, body)
+        (name, params, body, ret_ty)
     }
 
     fn parse_if(&mut self) -> Stmt {
@@ -1724,13 +1891,25 @@ impl Parser {
     }
 
     fn parse_factor(&mut self) -> Expr {
-        let mut neg_count = 0;
-        while matches!(self.current, Token::Minus) {
-            self.consume(Token::Minus);
-            neg_count += 1;
+        let mut ops: Vec<u8> = Vec::new(); // 0 = 负号, 1 = 逻辑非
+        loop {
+            if matches!(self.current, Token::Minus) { self.consume(Token::Minus); ops.push(0); }
+            else if matches!(self.current, Token::Not) { self.consume(Token::Not); ops.push(1); }
+            else { break; }
         }
 
         let mut expr = self.parse_primary();
+
+        // 后缀类型转换：expr -> i32/i64/float/str/bool
+        while matches!(self.current, Token::ArrowR) {
+            self.consume(Token::ArrowR);
+            let ty = match &self.current {
+                Token::Ident(s) => s.clone(),
+                _ => self.panic_here( "语法错误：-> 后需要类型名"),
+            };
+            self.consume(Token::Ident(ty.clone()));
+            expr = Expr::Cast(Box::new(expr), ty, self.line);
+        }
 
         // 修复核心：右侧改用 parse_primary，消除递归死循环
         while matches!(self.current, Token::Star | Token::Slash | Token::Percent) {
@@ -1745,16 +1924,20 @@ impl Parser {
             expr = Expr::BinOp(Box::new(expr), op, Box::new(right), self.line);
         }
 
-        // 保留全部连续负号逻辑，不新增语法拦截
-        for _ in 0..neg_count {
-            if self.has_ptr_expr(&expr) {
-                self.panic_here( "解析错误：指针不支持取负运算");
+        // 按原始顺序逆序应用前缀：-x / !x / -!x / !-x 均保持正确语义
+        for &op in ops.iter().rev() {
+            if op == 0 {
+                if self.has_ptr_expr(&expr) {
+                    self.panic_here( "解析错误：指针不支持取负运算");
+                }
+                expr = match expr {
+                    // 区间取负：负号作用于左端点（右端点的负号已由内部 parse_expr 处理）
+                    Expr::Range(l, r, ln) => Expr::Range(Box::new(Expr::Neg(l, ln)), r, ln),
+                    other => Expr::Neg(Box::new(other), self.line),
+                };
+            } else {
+                expr = Expr::Not(Box::new(expr), self.line);
             }
-            expr = match expr {
-                // 区间取负：负号作用于左端点（右端点的负号已由内部 parse_expr 处理）
-                Expr::Range(l, r, ln) => Expr::Range(Box::new(Expr::Neg(l, ln)), r, ln),
-                other => Expr::Neg(Box::new(other), self.line),
-            };
         }
         expr
     }
@@ -1824,6 +2007,11 @@ impl Parser {
                 self.consume(Token::Number(val));
                 Expr::Number(val, self.line)
             }
+            Token::Int64(n) => {
+                let val = *n;
+                self.consume(Token::Int64(val));
+                Expr::Int64(val, self.line)
+            }
             Token::Float(n) => {
                 let mut val = *n;
                 self.consume(Token::Float(val));
@@ -1855,15 +2043,44 @@ impl Parser {
                 let name = name.clone();
                 let ident_line = self.line; // 解析标识符前立刻捕获行号
                 self.consume(Token::Ident(name.clone()));
-                let mut full_name = name;
-                while self.current == Token::ColonColon {
-                    self.consume(Token::ColonColon);
-                    let next = match &self.current {
-                        Token::Ident(s) => s.clone(),
-                        _ => self.panic_here( ":: 后必须是标识符"),
-                    };
-                    self.consume(Token::Ident(next.clone()));
-                    full_name = format!("{}::{}", full_name, next);
+                let mut full_name;
+                // 首标识符是已知模块根（std/lib/已导入模块）时，`.` 与 `::` 均作命名空间分隔符
+                let is_mod_root = self.known_modules.contains(&name)
+                    || self.known_modules.iter().any(|m| m.starts_with(&format!("{}::", name)));
+                if is_mod_root {
+                    full_name = name;
+                    loop {
+                        if self.current == Token::ColonColon {
+                            self.consume(Token::ColonColon);
+                            let next = match &self.current {
+                                Token::Ident(s) => s.clone(),
+                                _ => self.panic_here( ":: 后必须是标识符"),
+                            };
+                            self.consume(Token::Ident(next.clone()));
+                            full_name = format!("{}::{}", full_name, next);
+                        } else if self.current == Token::Dot {
+                            self.consume(Token::Dot);
+                            let next = match &self.current {
+                                Token::Ident(s) => s.clone(),
+                                _ => self.panic_here( ". 后必须是标识符"),
+                            };
+                            self.consume(Token::Ident(next.clone()));
+                            full_name = format!("{}::{}", full_name, next);
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    full_name = name;
+                    while self.current == Token::ColonColon {
+                        self.consume(Token::ColonColon);
+                        let next = match &self.current {
+                            Token::Ident(s) => s.clone(),
+                            _ => self.panic_here( ":: 后必须是标识符"),
+                        };
+                        self.consume(Token::Ident(next.clone()));
+                        full_name = format!("{}::{}", full_name, next);
+                    }
                 }
                 if matches!(self.current, Token::LParen) {
                     self.consume(Token::LParen);
@@ -2142,6 +2359,7 @@ impl Parser {
             Expr::AddrOf(_, _) | Expr::RawAddr(_, _) | Expr::Deref(_,_) => true,
             Expr::DerefAssign(_, _, _) => true,
             Expr::Neg(e, _) => self.has_ptr_expr(e),
+            Expr::Not(e, _) => self.has_ptr_expr(e),
             Expr::MethodCall(obj, _, args, _) => self.has_ptr_expr(obj) || args.iter().any(|a| self.has_ptr_expr(a)),
             Expr::MemberAssign(obj, _, rhs, _) => self.has_ptr_expr(obj) || self.has_ptr_expr(rhs),
             Expr::PrivateMember(e, _, _) => self.has_ptr_expr(e),
@@ -2170,6 +2388,8 @@ impl Parser {
                 arms.iter().any(|(_, b)| self.has_ptr_expr(b))
             }
             Expr::Range(l, r, _) => self.has_ptr_expr(l) || self.has_ptr_expr(r),
+            Expr::Int64(_, _) => false,
+            Expr::Cast(e, _, _) => self.has_ptr_expr(e),
         }
     }
 }
@@ -2193,12 +2413,74 @@ fn op_token(op: &Op) -> Token {
     }
 }
 
+// 生成器：惰性 yield 执行（首版仅支持平铺 yield，控制流内 yield 暂不支持）
+struct GeneratorData {
+    body: Vec<Stmt>, // 剩余待执行语句（每次 yield 后截取）
+    env: Env,        // 生成器局部环境（含形参绑定，outer=定义处父环境）
+    done: bool,
+}
+
+fn stmt_has_yield(s: &Stmt) -> bool {
+    match s {
+        Stmt::Yield(..) => true,
+        Stmt::If(_, t, e, el, _) => {
+            if body_has_yield(t) || body_has_yield(el) { return true; }
+            e.iter().any(|(_, b)| body_has_yield(b))
+        }
+        Stmt::While(_, b, _) | Stmt::UnsafeBlock(b, _) => body_has_yield(b),
+        Stmt::For(_, _, _, b, _) => body_has_yield(b),
+        Stmt::Try { body, handler, .. } => body_has_yield(body) || body_has_yield(handler),
+        _ => false,
+    }
+}
+fn body_has_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_yield)
+}
+
+impl std::fmt::Debug for GeneratorData {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Generator(done={})", self.done)
+    }
+}
+fn body_has_nested_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s { Stmt::Yield(..) => false, _ => stmt_has_yield(s) })
+}
+
+/// 在函数体内查找控制流（if/while/for）内的首个 yield 位置 (line, col)
+fn find_nested_yield_pos(stmts: &[Stmt]) -> Option<(u32, u32)> {
+    for s in stmts {
+        if let Some(p) = nested_yield_in_blocks(s) { return Some(p); }
+    }
+    None
+}
+fn nested_yield_in_blocks(s: &Stmt) -> Option<(u32, u32)> {
+    let subs: Vec<&[Stmt]> = match s {
+        Stmt::If(_, t, elifs, e2, _) => {
+            let mut v = vec![t.as_slice()];
+            for (_, b) in elifs { v.push(b.as_slice()); }
+            v.push(e2.as_slice());
+            v
+        }
+        Stmt::While(_, b, _) => vec![b.as_slice()],
+        Stmt::For(_, _, _, b, _) => vec![b.as_slice()],
+        _ => return None,
+    };
+    for blk in subs {
+        for inner in blk {
+            if let Stmt::Yield(_, ln) = inner { return Some((*ln, 1)); }
+            if let Some(pp) = nested_yield_in_blocks(inner) { return Some(pp); }
+        }
+    }
+    None
+}
+
 // ==============================
 // 运行时值 Value
 // ==============================
 #[derive(Debug, Clone)]
 enum Value {
     Int(i32),
+    Int64(i64),
     Float(f64),
     String(PoolStr),
     Bool(bool),
@@ -2219,6 +2501,8 @@ enum Value {
     Dict(Rc<FastMap<String, Value>>),
     // 区间值：lo..hi（含端点），match 区间模式与区间表达式共享
     Range(f64, f64),
+    // 生成器对象：惰性 yield，next() 推进
+    Generator(Rc<RefCell<GeneratorData>>),
 }
 
 // 用户 throw 的异常标记（panic payload）。实际异常值存于 Interpreter.pending_throw，避免 Rc 非 Send 问题
@@ -2243,8 +2527,13 @@ fn value_dict_mut(v: &mut Value) -> &mut FastMap<String, Value> {
 fn value_matches(pat: &Value, subj: &Value) -> bool {
     match (pat, subj) {
         (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Int64(a), Value::Int64(b)) => a == b,
+        (Value::Int64(a), Value::Int(b)) => *a == *b as i64,
+        (Value::Int(a), Value::Int64(b)) => (*a as i64) == *b,
         (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
         (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+        (Value::Int64(a), Value::Float(b)) => (*a as f64) == *b,
+        (Value::Float(a), Value::Int64(b)) => *a == (*b as f64),
         (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
@@ -2258,6 +2547,7 @@ struct ThrowMarker;
 fn fmt_value(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
+        Value::Int64(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.as_str().to_string(),
         Value::Bool(b) => b.to_string(),
@@ -2271,6 +2561,7 @@ fn fmt_value(v: &Value) -> String {
         Value::Class(c) => format!("(class {})", c.name),
         Value::Instance(i) => format!("(instance of {})", i.borrow().class.name),
         Value::Closure(_) => "(closure)".to_string(),
+        Value::Generator(_) => "(generator)".to_string(),
         Value::Dict(map) => {
             let items: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, fmt_value(v))).collect();
             format!("{{{}}}", items.join(", "))
@@ -2325,7 +2616,7 @@ enum GuiControl {
     Input { label: String, value: String, onchange: Value },
     InputVar { label: String, unit: Rc<RefCell<Value>> },
     TextArea { label: String, unit: Rc<RefCell<Value>> },
-    Output { unit: Rc<RefCell<Value>> },
+    Output { unit: Rc<RefCell<Value>>, last: Option<String> },
     Terminal { unit: Rc<RefCell<Value>>, onsubmit: Value },  // 可编辑输出区：可自由输入，Ctrl+Enter 提交
     Checkbox { label: String, value: bool, onchange: Value },
     Slider { label: String, min: f64, max: f64, value: f64, onchange: Value },
@@ -2366,6 +2657,13 @@ fn setup_cjk_fonts(ctx: &egui::Context) {
 }
 
 // eframe 应用：渲染控件，点击时通过裸指针执行 XLang 回调闭包
+#[cfg(feature = "gui")]
+mod logo_icon {
+    pub const W: u32 = 128;
+    pub const H: u32 = 128;
+    pub const RGBA: &[u8] = include_bytes!("logo_icon.rgba");
+}
+
 #[cfg(feature = "gui")]
 struct GuiApp {
     controls: Vec<GuiControl>,
@@ -2534,13 +2832,29 @@ fn render_one(ui: &mut egui::Ui, c: &mut GuiControl, pending: &mut Vec<(Value, V
                     *unit.borrow_mut() = Value::String(PoolStr::new(&s));
                 }
             }
-            GuiControl::Output { unit } => {
-                // 实时显示共享变量的字符串值（IDE 状态栏/运行输出用）
-                let s = match &*unit.borrow() {
-                    Value::String(x) => x.as_str().to_string(),
-                    _ => String::new(),
-                };
-                ui.label(s);
+            GuiControl::Output { unit, last } => {
+                // 只读输出：缓存上次字符串，共享值未变则不重新 to_string（大输出避免每帧复制）
+                // borrow guard 需在显式作用域内用完即释放，避免 as_str 切片悬垂
+                {
+                    let guard = unit.borrow();
+                    let cur = match &*guard {
+                        Value::String(x) => Some(x.as_str()),
+                        _ => None,
+                    };
+                    let changed = match (cur, last.as_deref()) {
+                        (Some(c), Some(l)) => c != l,
+                        (None, Some(_)) => true,
+                        (Some(_), None) => true,
+                        (None, None) => false,
+                    };
+                    if changed {
+                        if let Some(c) = cur { *last = Some(c.to_string()); }
+                        else { *last = None; }
+                    }
+                }
+                if let Some(t) = last.as_deref() {
+                    ui.label(t);
+                }
             }
             GuiControl::Terminal { unit, onsubmit } => {
                 // 可编辑终端：显示输出 + 可自由输入；Ctrl+Enter 提交输入给回调并清空
@@ -2712,7 +3026,7 @@ fn collect_expr_refs(e: &Expr, refs: &mut Vec<u32>) {
         Expr::Call(n, args, _) => { refs.push(interner().get(&n)); for a in args { collect_expr_refs(a, refs); } }
         Expr::Assign(n, v, _) => { refs.push(*n); collect_expr_refs(v, refs); }
         Expr::IndexAssign(a, i, v, _) => { collect_expr_refs(a, refs); collect_expr_refs(i, refs); collect_expr_refs(v, refs); }
-        Expr::AddrOf(i, _) | Expr::RawAddr(i, _) | Expr::Deref(i, _) | Expr::Neg(i, _) => collect_expr_refs(i, refs),
+        Expr::AddrOf(i, _) | Expr::RawAddr(i, _) | Expr::Deref(i, _) | Expr::Neg(i, _) | Expr::Not(i, _) => collect_expr_refs(i, refs),
         Expr::DerefAssign(p, v, _) => { collect_expr_refs(p, refs); collect_expr_refs(v, refs); }
         Expr::Member(o, _, _) => collect_expr_refs(o, refs),
         Expr::MethodCall(o, _, args, _) => { collect_expr_refs(o, refs); for a in args { collect_expr_refs(a, refs); } }
@@ -2726,6 +3040,8 @@ fn collect_expr_refs(e: &Expr, refs: &mut Vec<u32>) {
             for (_, b) in arms { collect_expr_refs(b, refs); }
         }
         Expr::Range(l, r, _) => { collect_expr_refs(l, refs); collect_expr_refs(r, refs); }
+        Expr::Int64(_, _) => {}
+        Expr::Cast(e, _, _) => collect_expr_refs(e, refs),
     }
 }
 
@@ -2733,7 +3049,7 @@ fn collect_stmt_refs(s: &Stmt, refs: &mut Vec<u32>, locals: &mut Vec<u32>) {
     match s {
         Stmt::Let(n, e, _) => { locals.push(*n); collect_expr_refs(e, refs); }
         Stmt::Const(n, e, _) => { locals.push(*n); collect_expr_refs(e, refs); }
-        Stmt::FnDef(_, params, body, _) => { for p in params { locals.push(interner().get(p)); } for b in body { collect_stmt_refs(b, refs, locals); } }
+        Stmt::FnDef(_, params, body, _, _) => { for p in params { locals.push(interner().get(p)); } for b in body { collect_stmt_refs(b, refs, locals); } }
         Stmt::If(c, t, elifs, e2, _) => {
             collect_expr_refs(c, refs);
             for x in t { collect_stmt_refs(x, refs, locals); }
@@ -2746,6 +3062,7 @@ fn collect_stmt_refs(s: &Stmt, refs: &mut Vec<u32>, locals: &mut Vec<u32>) {
         Stmt::Expr(e, _) => collect_expr_refs(e, refs),
         Stmt::Return(Some(e), _) => collect_expr_refs(e, refs),
         Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Yield(e, _) => collect_expr_refs(e, refs),
         Stmt::Throw(e, _) => collect_expr_refs(e, refs),
         Stmt::Try { body, catch_var, handler, .. } => {
             for x in body { collect_stmt_refs(x, refs, locals); }
@@ -2776,6 +3093,7 @@ impl Value {
     fn is_truthy(&self) -> bool {
         match self {
             Value::Int(n) => *n != 0,
+            Value::Int64(n) => *n != 0,
             Value::Float(f) => *f != 0.0,
             Value::String(s) => !s.is_empty(),
             Value::Bool(b) => *b,
@@ -2789,6 +3107,7 @@ impl Value {
             Value::Instance(_) => true,
             Value::Closure(_) => true,
             Value::Dict(map) => !map.is_empty(),
+            Value::Generator(_) => true,
         }
     }
 
@@ -2884,7 +3203,7 @@ struct VarEntry {
 
 #[derive(Default, Clone)]
 struct Env {
-    vars: FastMap<u32, VarEntry>,
+    vars: FastMap<u32, Box<VarEntry>>,
     outer: Option<Box<Env>>,
 }
 
@@ -2936,7 +3255,7 @@ impl Env {
 
     fn get_mut_id(&mut self, id: u32) -> Option<&mut VarEntry> {
         if let Some(entry) = self.vars.get_mut(&id) {
-            return Some(entry);
+            return Some(&mut **entry);
         }
         if let Some(outer) = &mut self.outer {
             outer.get_mut_id(id)
@@ -3005,11 +3324,11 @@ impl Env {
             Value::String(_) => MemKind::Heap,
             _ => MemKind::Arena,
         };
-        self.vars.insert(id, VarEntry {
+        self.vars.insert(id, Box::new(VarEntry {
             value: VarStorage::Plain(val),
             is_const: false,
             mem_kind,
-        });
+        }));
     }
 
     fn define_const_id(&mut self, id: u32, val: Value) {
@@ -3017,11 +3336,11 @@ impl Env {
             Value::String(_) => MemKind::Heap,
             _ => MemKind::Arena,
         };
-        self.vars.insert(id, VarEntry {
+        self.vars.insert(id, Box::new(VarEntry {
             value: VarStorage::Plain(val),
             is_const: true,
             mem_kind,
-        });
+        }));
     }
 
     fn remove_id(&mut self, id: u32) {
@@ -3033,11 +3352,11 @@ impl Env {
             Value::String(_) => MemKind::Heap,
             _ => MemKind::Arena,
         };
-        self.vars.insert(id, VarEntry {
+        self.vars.insert(id, Box::new(VarEntry {
             value: VarStorage::Shared(unit),
             is_const: false,
             mem_kind,
-        });
+        }));
     }
 
     fn get_unit_id(&self, id: u32) -> Option<Rc<RefCell<Value>>> {
@@ -3090,6 +3409,8 @@ enum ModuleExportItem {
     Let(String, Expr, u32),
     Const(String, Expr, u32),
     Fn(String, Vec<String>, Vec<Stmt>, u32),
+    /// 模块内定义的类（class）：名字, 定义, 行号
+    Class(String, ClassDef, u32),
 }
 
 /// key: 完整模块路径字符串，例如 "lib::math"
@@ -3107,9 +3428,9 @@ type ModuleNativeFuncs = HashMap<String, HashMap<String, fn(Vec<Value>) -> Value
 /// 取语句的源码行号（所有 Stmt 变体最后一个 u32 字段即行号）
 fn stmt_line(s: &Stmt) -> u32 {
     match s {
-        Stmt::Let(_, _, l) | Stmt::Const(_, _, l) | Stmt::FnDef(_, _, _, l)
+        Stmt::Let(_, _, l) | Stmt::Const(_, _, l) | Stmt::FnDef(_, _, _, _, l)
         | Stmt::Print(_, l) | Stmt::Expr(_, l) | Stmt::Return(_, l)
-        | Stmt::Break(l) | Stmt::Continue(l) | Stmt::UnsafeBlock(_, l) => *l,
+        | Stmt::Break(l) | Stmt::Continue(l) | Stmt::UnsafeBlock(_, l) | Stmt::Yield(_, l) => *l,
         Stmt::If(_, _, _, _, l) | Stmt::While(_, _, l) | Stmt::For(_, _, _, _, l) => *l,
         Stmt::ImportItem { line, .. } => *line,
         Stmt::Class(_, l) => *l,
@@ -3142,6 +3463,9 @@ struct Interpreter {
     /// GUI：gui_run 异步执行的 mpsc 接收端队列（主线程轮询写回共享变量）
     #[cfg(feature = "gui")]
     gui_async_rx: Vec<std::sync::mpsc::Receiver<(String, String)>>,
+    /// GUI：窗口图标文件路径（gui_icon(path) 设置；未设置时默认用内嵌 logo.ico）
+    #[cfg(feature = "gui")]
+    gui_icon: Option<String>,
     lib_funcs: HashMap<String, fn(Vec<Value>) -> Value>,
     module_native: ModuleNativeFuncs,
     mod_alias: HashMap<String, String>,
@@ -3150,6 +3474,8 @@ struct Interpreter {
     current_class: Option<String>,
     /// 当前正在执行的方法/构造器的 self 实例（供 super() 调用父类构造）
     current_self: Option<Value>,
+    /// 函数/方法调用栈（名称, 定义行）：错误时附加根源标签
+    ctx_stack: Vec<(String, u32)>,
     pub file: String,
     pub line: u32,
     /// 命令行传给脚本的参数（xlang run script.x arg1 arg2 ...）
@@ -3159,9 +3485,21 @@ struct Interpreter {
 }
 
 impl Interpreter {
+    /// 统一错误出口：若正处于函数/方法调用栈内，附加函数定义处作为根源标签
+    fn emit_script_error(&self, line: u32, msg: &str) -> ! {
+        if let Some((cname, cline)) = self.ctx_stack.last() {
+            script_panic_at_multi(
+                &self.file, line, 1, msg,
+                vec![(*cline, 1, format!("位于 {cname}（定义于此处）"))],
+            );
+        } else {
+            script_panic_at(&self.file, line, 1, msg);
+        }
+    }
+
     /// 以解释器当前(文件,行)抛出脚本错误，列号回退到1（解释期不明列号）
     fn panic_here(&self, msg: &str) -> ! {
-        script_panic_at(&self.file, self.line, 1, msg)
+        self.emit_script_error(self.line, msg)
     }
 
     /// 调用内置函数：捕获 panic，把参数/执行错误转成带当前语句行号的 ariadne 错误
@@ -3176,14 +3514,14 @@ impl Interpreter {
                 } else {
                     "内置函数内部错误".to_string()
                 };
-                script_panic_at(&self.file, self.line, 1, &msg)
+                self.emit_script_error(self.line, &msg)
             }
         }
     }
 
     /// 以解释器当前文件 + 指定行号抛出脚本错误（列号回退1）
     fn panic_at(&self, line: u32, _col: u32, msg: &str) -> ! {
-        script_panic_at(&self.file, line, 1, msg)
+        self.emit_script_error(line, msg)
     }
 
     fn new() -> Self {
@@ -3204,12 +3542,15 @@ impl Interpreter {
             gui_ctx: None,
             #[cfg(feature = "gui")]
             gui_async_rx: Vec::new(),
+            #[cfg(feature = "gui")]
+            gui_icon: None,
             lib_funcs: HashMap::new(),
             module_native: HashMap::new(),
             mod_alias: HashMap::new(),
             module_cache: ModuleCache::default(),
             current_class: None,
             current_self: None,
+            ctx_stack: Vec::new(),
             file: String::new(),
             line: 0,
             script_args: Vec::new(),
@@ -3221,6 +3562,36 @@ impl Interpreter {
             let parts: Vec<String> = args.iter().map(fmt_value).collect();
             println!("{}", parts.join(" "));
             Value::Int(0)
+        });
+        // keys(dict) 返回 dict 全部键（字符串数组），用于遍历/序列化
+        interp.lib_funcs.insert("keys".to_string(), |args| {
+            if args.len() != 1 { panic!("keys(dict) 需要一个参数"); }
+            match &args[0] {
+                Value::Dict(map) => {
+                    let mut ks = Vec::new();
+                    for k in map.keys() { ks.push(Value::String(PoolStr::new(k.as_str()))); }
+                    Value::Array(Rc::new(ks))
+                }
+                _ => panic!("keys 参数必须是 dict"),
+            }
+        });
+        // type(v) 返回值的类型名
+        interp.lib_funcs.insert("type".to_string(), |args| {
+            if args.len() != 1 { panic!("type(v) 需要一个参数"); }
+            let s = match &args[0] {
+                Value::Int(_) => "int",
+                Value::Float(_) => "float",
+                Value::String(_) => "str",
+                Value::Bool(_) => "bool",
+                Value::Array(_) => "array",
+                Value::Dict(_) => "dict",
+                Value::Closure(_) | Value::Class(_) => "func",
+                Value::Instance(_) => "instance",
+                Value::Generator(_) => "generator",
+                Value::Range(_, _) => "range",
+                _ => "ptr",
+            };
+            Value::String(PoolStr::new(s))
         });
         interp.lib_funcs.insert("substr".to_string(), |args| {
             if args.len() != 3 {
@@ -3474,6 +3845,7 @@ impl Interpreter {
             }
             let s = match &args[0] {
                 Value::Int(n) => n.to_string(),
+                Value::Int64(n) => n.to_string(),
                 Value::Float(f) => f.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::String(st) => st.as_str().to_string(),
@@ -3488,6 +3860,7 @@ impl Interpreter {
                 Value::Class(c) => format!("(class {})", c.name),
                 Value::Instance(i) => format!("(instance of {})", i.borrow().class.name),
         Value::Closure(_) => "(closure)".to_string(),
+        Value::Generator(_) => "(generator)".to_string(),
         Value::Dict(_) => fmt_value(&args[0]),
             };
             Value::String(PoolStr::new(&s))
@@ -3526,6 +3899,7 @@ impl Interpreter {
             }
             match &args[0] {
                 Value::Int(n) => Value::Float(*n as f64),
+                Value::Int64(n) => Value::Float(*n as f64),
                 Value::Float(f) => Value::Float(*f),
                 Value::String(st) => {
                     let t = st.as_str().trim();
@@ -3545,6 +3919,7 @@ impl Interpreter {
             }
             match &args[0] {
                 Value::Int(n) => Value::Int(*n),
+                Value::Int64(n) => Value::Int(*n as i32),
                 Value::Float(f) => Value::Int(*f as i32),
                 Value::String(st) => {
                     let t = st.as_str().trim();
@@ -3557,71 +3932,6 @@ impl Interpreter {
             }
         });
 
-        // pow(x, n)：x 的 n 次幂，返回 Float
-        interp.lib_funcs.insert("pow".to_string(), |args| {
-            if args.len() != 2 {
-                panic!("pow() 需要2个参数：底数，指数");
-            }
-            let base = match &args[0] {
-                Value::Int(n) => *n as f64,
-                Value::Float(f) => *f,
-                _ => panic!("pow 底数必须是数字"),
-            };
-            let exp = match &args[1] {
-                Value::Int(n) => *n as f64,
-                Value::Float(f) => *f,
-                _ => panic!("pow 指数必须是数字"),
-            };
-            Value::Float(base.powf(exp))
-        });
-
-        // abs(x)：绝对值，保持原类型
-        interp.lib_funcs.insert("abs".to_string(), |args| {
-            if args.len() != 1 {
-                panic!("abs() 仅接收1个参数");
-            }
-            match args[0] {
-                Value::Int(n) => Value::Int(n.abs()),
-                Value::Float(f) => Value::Float(f.abs()),
-                _ => panic!("abs 参数必须是数字"),
-            }
-        });
-
-        // sqrt(x)：平方根，返回 Float
-        interp.lib_funcs.insert("sqrt".to_string(), |args| {
-            if args.len() != 1 {
-                panic!("sqrt() 仅接收1个参数");
-            }
-            let n = match &args[0] {
-                Value::Int(v) => *v as f64,
-                Value::Float(v) => *v,
-                _ => panic!("sqrt 参数必须是数字"),
-            };
-            if n < 0.0 {
-                panic!("sqrt 参数不能为负数");
-            }
-            Value::Float(n.sqrt())
-        });
-
-        // round(x, digits)：四舍五入保留 digits 位小数，返回 Float
-        interp.lib_funcs.insert("round".to_string(), |args| {
-            if args.len() != 2 {
-                panic!("round() 需要2个参数：数值，保留小数位数");
-            }
-            let n = match &args[0] {
-                Value::Int(v) => *v as f64,
-                Value::Float(v) => *v,
-                _ => panic!("round 第一个参数必须是数字"),
-            };
-            let digits = match args[1] {
-                Value::Int(d) => d,
-                _ => panic!("round 第二个参数必须是整数"),
-            };
-            if !(0..=15).contains(&digits) {
-                panic!("round 保留位数必须在 0~15 之间");
-            }
-            Value::Float(format_f64(n, digits))
-        });
         // ========== 多内存池 内置函数注册 ==========
         // 全局默认池：无参
         interp.lib_funcs.insert("mem_global_init".to_string(), |_args| {
@@ -4072,6 +4382,11 @@ impl Interpreter {
 
     /// 通用函数调用：切换局部环境、绑定形参、执行函数体、恢复父环境
     fn call_func(&mut self, func: Func, evaluated_args: Vec<Value>) -> Value {
+        // 生成器函数：不立即执行，返回可迭代的生成器对象（惰性）
+        if body_has_yield(&func.body) {
+            return self.make_generator(func, evaluated_args);
+        }
+        self.ctx_stack.push((func.name.clone(), func.line));
         // 取出当前环境作为父环境（不克隆，直接所有权转移）
         let parent_env = std::mem::replace(&mut self.env, Env::new());
         // 创建嵌套局部环境，父环境直接作为外层作用域
@@ -4084,12 +4399,71 @@ impl Interpreter {
         self.env = local_env;
 
         let (result, _ctrl) = self.exec_stmts_return_last(&func.body);
+        let result = match &func.ret_ty {
+            Some(rt) => self.cast_value(result, rt, func.line),
+            None => result,
+        };
 
         // 执行完毕，取回父环境（子函数对外部变量的修改已保留在父环境中）
         let local_env = std::mem::replace(&mut self.env, Env::new());
         self.env = *local_env.outer.unwrap();
+        self.ctx_stack.pop();
 
         result
+    }
+    /// 生成器调用：不执行函数体，构造含参数环境与剩余语句的生成器对象
+    fn make_generator(&mut self, func: Func, evaluated_args: Vec<Value>) -> Value {
+        // 首版仅支持平铺 yield（控制流内 yield 暂不支持）
+        if body_has_nested_yield(&func.body) {
+            if let Some((ln, cl)) = find_nested_yield_pos(&func.body) {
+                script_panic_at_multi(
+                    &self.file, self.line, 1,
+                    "暂不支持在 if/while/for 内使用 yield（当前仅支持平铺 yield）",
+                    vec![(ln, cl, "此处的 yield 位于控制流（if/while/for）内".to_string())],
+                );
+            }
+            self.panic_here("暂不支持在 if/while/for 内使用 yield（当前仅支持平铺 yield）");
+        }
+        let caller_env = std::mem::replace(&mut self.env, Env::new());
+        let mut local_env = Env::nested(caller_env.clone());
+        for (param, arg) in func.params.iter().zip(evaluated_args) {
+            local_env.define_var(param.clone(), arg);
+        }
+        let gd = GeneratorData { body: func.body, env: local_env, done: false };
+        self.env = caller_env;
+        Value::Generator(Rc::new(RefCell::new(gd)))
+    }
+    /// 推进生成器到下一个 yield（None = 生成器结束）
+    fn generator_next_val(&mut self, g: Rc<RefCell<GeneratorData>>) -> Option<Value> {
+        let caller_env = std::mem::replace(&mut self.env, Env::new());
+        let mut g = g.borrow_mut();
+        if g.done {
+            self.env = caller_env;
+            return None;
+        }
+        self.env = std::mem::replace(&mut g.env, Env::new());
+        let mut produced = Value::Int(0);
+        let mut rest = Vec::new();
+        let has = self.exec_stmts_until_yield(&g.body, &mut produced, &mut rest);
+        if !has { g.done = true; }
+        g.body = rest;
+        g.env = std::mem::replace(&mut self.env, Env::new());
+        self.env = caller_env;
+        if has { Some(produced) } else { None }
+    }
+    /// 顺序执行语句，遇第一个 yield 产出值并保存剩余语句（平铺）
+    fn exec_stmts_until_yield(&mut self, stmts: &[Stmt], produced: &mut Value, rest: &mut Vec<Stmt>) -> bool {
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Yield(expr, _) = s {
+                *produced = self.eval_expr(expr);
+                rest.clear();
+                rest.extend_from_slice(&stmts[i + 1..]);
+                return true;
+            }
+            self.line = stmt_line(s);
+            let _ = self.exec_stmt(s);
+        }
+        false
     }
     /// 闭包调用：注入捕获的共享单元 + 绑定参数，执行闭包体，恢复环境
     fn call_closure(&mut self, closure: &Rc<ClosureData>, args: Vec<Value>, call_line: u32) -> Value {
@@ -4108,6 +4482,10 @@ impl Interpreter {
         }
         self.env = local_env;
         let (result, _ctrl) = self.exec_stmts_return_last(&closure.func.body);
+        let result = match &closure.func.ret_ty {
+            Some(rt) => self.cast_value(result, rt, closure.func.line),
+            None => result,
+        };
         let local_env = std::mem::replace(&mut self.env, Env::new());
         self.env = *local_env.outer.unwrap();
         result
@@ -4173,6 +4551,7 @@ impl Interpreter {
     fn call_gui(&mut self, name: &str, args: Vec<Value>, ln: u32) -> Value {
         match name {
             "gui_window" => self.gui_window(args, ln),
+            "gui_icon" => self.gui_icon(args, ln),
             "gui_button" => self.gui_button(args, ln),
             "gui_text" => self.gui_text(args, ln),
             "gui_heading" => self.gui_heading(args, ln),
@@ -4208,6 +4587,59 @@ impl Interpreter {
 
     /// gui_window(title, builder)：执行 builder 收集控件，然后进入 eframe 事件循环直到窗口关闭
     #[cfg(feature = "gui")]
+    /// 解码 ico 文件为 egui 图标数据（支持 PNG 压缩条目，如 PIL 生成的 ico）
+    #[cfg(feature = "gui")]
+    fn decode_ico(&self, bytes: &[u8]) -> Option<egui::IconData> {
+        if bytes.len() < 6 { return None; }
+        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        // 第一遍：选尺寸最大的 PNG 条目（目录宽高为 0 表示 256）
+        let mut best: Option<(usize, usize, usize)> = None; // (wh, off, size)
+        for i in 0..count {
+            let e = 6 + i * 16;
+            if e + 16 > bytes.len() { break; }
+            let wd = if bytes[e] == 0 { 256 } else { bytes[e] as usize };
+            let ht = if bytes[e+1] == 0 { 256 } else { bytes[e+1] as usize };
+            let wh = wd.max(ht);
+            let size = u32::from_le_bytes([bytes[e+8], bytes[e+9], bytes[e+10], bytes[e+11]]) as usize;
+            let off = u32::from_le_bytes([bytes[e+12], bytes[e+13], bytes[e+14], bytes[e+15]]) as usize;
+            if off + size <= bytes.len() && size > 8 && bytes[off] == 0x89 && bytes[off+1] == 0x50 {
+                if best.is_none() || wh > best.unwrap().0 { best = Some((wh, off, size)); }
+            }
+        }
+        let (_, off, size) = best?;
+        let data = &bytes[off..off+size];
+        let decoder = png::Decoder::new(std::io::Cursor::new(data));
+        let mut reader = decoder.read_info().ok()?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).ok()?;
+        let (w, h) = (info.width as usize, info.height as usize);
+        let ch = info.color_type.samples() as usize;
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for px in 0..(w * h) {
+            let i = px * ch;
+            let (r, g, b) = match info.color_type {
+                png::ColorType::Rgba => (buf[i], buf[i+1], buf[i+2]),
+                png::ColorType::Rgb => (buf[i], buf[i+1], buf[i+2]),
+                png::ColorType::Grayscale => (buf[i], buf[i], buf[i]),
+                _ => continue,
+            };
+            let a = if info.color_type == png::ColorType::Rgba { buf[i+3] } else { 255 };
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+        if w * h * 4 != rgba.len() { return None; }
+        Some(egui::IconData { rgba, width: w as u32, height: h as u32 })
+    }
+
+    /// gui_icon(path)：设置窗口图标为指定 .ico 文件（覆盖默认 logo.ico）
+    #[cfg(feature = "gui")]
+    fn gui_icon(&mut self, args: Vec<Value>, ln: u32) -> Value {
+        if args.len() != 1 { self.panic_at(ln, 1, "gui_icon(path) 需要1个参数"); }
+        let path = match &args[0] { Value::String(s) => s.as_str().to_string(), _ => self.panic_at(ln, 1, "gui_icon 参数必须是图标文件路径字符串") };
+        self.gui_icon = Some(path);
+        Value::Int(0)
+    }
+
+    #[cfg(feature = "gui")]
     fn gui_window(&mut self, args: Vec<Value>, ln: u32) -> Value {
         if self.gui_active {
             self.panic_at(ln, 1, "不支持嵌套窗口（gui_window 内不能再开窗口）");
@@ -4230,6 +4662,13 @@ impl Interpreter {
             let nv = |v: &Value| -> f32 { match v { Value::Int(n) => *n as f32, Value::Float(f) => *f as f32, _ => 0.0 } };
             options.viewport.inner_size = Some(egui::Vec2::new(nv(&args[1]), nv(&args[2])));
         }
+        // 窗口图标：优先 gui_icon(path) 指定的 ico，否则默认用内嵌 logo.ico
+        let icon = if let Some(p) = self.gui_icon.take() {
+            std::fs::read(&p).ok().and_then(|b| self.decode_ico(&b))
+        } else {
+            Some(egui::IconData { rgba: logo_icon::RGBA.to_vec(), width: logo_icon::W, height: logo_icon::H })
+        };
+        options.viewport.icon = icon.map(std::sync::Arc::new);
         let _ = eframe::run_native(&title, options, Box::new(move |cc| {
             setup_cjk_fonts(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -4332,7 +4771,7 @@ impl Interpreter {
         let varname = match &args[0] { Value::String(s) => s.as_str().to_string(), _ => self.panic_at(ln, 1, "gui_output 参数必须是绑定变量名字符串") };
         let id = interner().get(&varname);
         if let Some(unit) = self.env.promote_to_shared_id(id) {
-            self.push_control(GuiControl::Output { unit });
+            self.push_control(GuiControl::Output { unit, last: None });
             Value::Int(0)
         } else {
             self.panic_at(ln, 1, &format!("gui_output 绑定变量未定义: {}", varname))
@@ -4688,21 +5127,22 @@ impl Interpreter {
     /// 实例方法/构造器调用：自动注入 self 变量（无论方法是否显式声明 self 形参），
     /// 并在调用期间记录当前类以支持私有字段访问
     fn call_func_with_self(&mut self, func: Func, self_val: Value, args: Vec<Value>, call_line: u32, method_class: Option<String>) -> Value {
-        // 方法/构造器必须显式声明 self 作为第一个形参
-        if func.params.first() != Some(&"self".to_string()) {
-            self.panic_at(call_line, 1, "方法/构造器第一个参数必须是 self");
+        // 方法/构造器：支持显式 self 或隐式 self（构造器 init/new 可省 self，自动注入）
+        let has_explicit_self = func.params.first() == Some(&"self".to_string());
+        let expect_args = if has_explicit_self { func.params.len() - 1 } else { func.params.len() };
+        if expect_args != args.len() {
+            self.panic_at(call_line, 1, &format!("方法参数数量不匹配：需要 {}，实际 {}", expect_args, args.len()));
         }
-        // 校验参数数量：self + 其余形参 == 实参 + 1
-        if func.params.len() != args.len() + 1 {
-            self.panic_at(call_line, 1, &format!("方法参数数量不匹配：需要 {}，实际 {}", func.params.len() - 1, args.len()));
-        }
+        self.ctx_stack.push((format!("{}.{}", method_class.as_deref().unwrap_or("?"), func.name), func.line));
         let parent_env = std::mem::replace(&mut self.env, Env::new());
         let mut local_env = Env::nested(parent_env);
-        // 绑定 self 为第一个形参
+        // self 始终注入（隐式 self 不占形参位）
         local_env.define_var("self".to_string(), self_val.clone());
-        // 绑定其余形参
-        for (i, p) in func.params.iter().skip(1).enumerate() {
-            local_env.define_var(p.clone(), args[i].clone());
+        // 绑定形参：显式 self 跳过第一个，隐式 self 全部绑定
+        for (i, p) in func.params.iter().enumerate() {
+            if has_explicit_self && i == 0 { continue; }
+            let arg_idx = if has_explicit_self { i - 1 } else { i };
+            local_env.define_var(p.clone(), args[arg_idx].clone());
         }
         self.env = local_env;
         let saved_class = self.current_class.clone();
@@ -4710,10 +5150,15 @@ impl Interpreter {
         self.current_class = method_class;
         self.current_self = Some(self_val);
         let (result, _ctrl) = self.exec_stmts_return_last(&func.body);
+        let result = match &func.ret_ty {
+            Some(rt) => self.cast_value(result, rt, func.line),
+            None => result,
+        };
         self.current_class = saved_class;
         self.current_self = saved_self;
         let local_env = std::mem::replace(&mut self.env, Env::new());
         self.env = *local_env.outer.unwrap();
+        self.ctx_stack.pop();
         result
     }
 
@@ -4953,6 +5398,8 @@ impl Interpreter {
         match stmt {
             Stmt::Break(_) => (Value::Int(0), LoopControl::Break),
             Stmt::Continue(_) => (Value::Int(0), LoopControl::Continue),
+            // yield：生成器平铺路径由 exec_stmts_until_yield 处理；此处仅保证穷尽
+            Stmt::Yield(expr, _) => { let v = self.eval_expr(expr); (v, LoopControl::None) }
 
             // throw 表达式：保存值后以 ThrowMarker panic 跨栈冒泡（含跨函数/循环）
             Stmt::Throw(expr, _) => {
@@ -4995,8 +5442,8 @@ impl Interpreter {
                 (Value::Int(0), LoopControl::None)
             }
 
-            Stmt::FnDef(name, params, body, _) => {
-                self.funcs.insert(name.clone(), Func { params: params.clone(), body: body.clone() });
+            Stmt::FnDef(name, params, body, _ret, ln) => {
+                self.funcs.insert(name.clone(), Func { name: name.clone(), line: *ln, params: params.clone(), body: body.clone(), ret_ty: None });
                 (Value::Int(0), LoopControl::None)
             }
 
@@ -5045,6 +5492,7 @@ impl Interpreter {
                 fn print_value(v: &Value) {
                     match v {
                         Value::Int(n) => print!("{}", n),
+                        Value::Int64(n) => print!("{}", n),
                         Value::Float(f) => print!("{}", f),
                         Value::String(s) => print!("{}", s.as_str()),
                         Value::Bool(b) => print!("{}", b),
@@ -5063,6 +5511,7 @@ impl Interpreter {
                         Value::Class(class_rc) => print!("(class {})", class_rc.name),
                         Value::Instance(inst) => print!("(instance of {})", inst.borrow().class.name),
                         Value::Closure(_) => print!("(closure)"),
+                        Value::Generator(_) => print!("(generator)"),
                         Value::Dict(map) => {
                             print!("{{");
                             let mut first = true;
@@ -5087,8 +5536,43 @@ impl Interpreter {
 
             Stmt::For(var_name, start, end, body, _) => {
                 let start_val = self.eval_expr(&start);
+                // 生成器遍历：for x in gen()
+                if let Value::Generator(g) = &start_val {
+                    loop {
+                        match self.generator_next_val(g.clone()) {
+                            Some(v) => {
+                                self.env.define_var_id(*var_name, v);
+                                let (res, ctrl) = self.exec_stmts_return_last(body);
+                                self.env.vars.remove(var_name);
+                                match ctrl {
+                                    LoopControl::Break => break,
+                                    LoopControl::Continue => continue,
+                                    LoopControl::Return(_) => return (res, ctrl),
+                                    LoopControl::None => (),
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    return (Value::Int(0), LoopControl::None);
+                }
+                // 数组遍历：for x in arr
+                if let Value::Array(arr) = &start_val {
+                    for item in arr.iter() {
+                        self.env.define_var_id(*var_name, item.clone());
+                        let (res, ctrl) = self.exec_stmts_return_last(body);
+                        self.env.vars.remove(var_name);
+                        match ctrl {
+                            LoopControl::Break => break,
+                            LoopControl::Continue => continue,
+                            LoopControl::Return(_) => return (res, ctrl),
+                            LoopControl::None => (),
+                        }
+                    }
+                    return (Value::Int(0), LoopControl::None);
+                }
+                // 区间遍历（原有）
                 let end_val = self.eval_expr(&end);
-
                 let start_num = match start_val {
                     Value::Int(n) => n,
                     Value::Float(f) => f as i32,
@@ -5138,8 +5622,12 @@ impl Interpreter {
                 (val, LoopControl::None)
             }
 
-            Stmt::ImportItem { lib_path: _, parts, alias, import_all: _ , ..} => {
-                resolve_import(self, parts);
+            Stmt::ImportItem { lib_path: _, parts, alias, import_all: _, names, .. } => {
+                if let Some(ns) = names {
+                    resolve_named_import(self, parts, ns);
+                } else {
+                    resolve_import(self, parts);
+                }
                 if let Some(alias_name) = alias {
                     let full_mod_path = parts.join("::");
                     self.mod_alias.insert(alias_name.clone(), full_mod_path);
@@ -5161,8 +5649,47 @@ impl Interpreter {
         }
     }
 
+    /// 类型转换：expr -> i32/i64/float/str/bool
+    fn eval_cast(&mut self, inner: &Expr, ty: &str, ln: u32) -> Value {
+        let v = self.eval_expr(inner);
+        self.cast_value(v, ty, ln)
+    }
+
+    /// 值类型转换：v -> i32/i64/float/str/bool
+    fn cast_value(&mut self, v: Value, ty: &str, ln: u32) -> Value {
+        match ty {
+            "i32" | "int" => match v {
+                Value::Int(i) => Value::Int(i),
+                Value::Int64(i) => Value::Int(i as i32),
+                Value::Float(f) => Value::Int(f as i32),
+                Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
+                _ => self.panic_at(ln, 1, "类型转换失败：不能转 i32"),
+            },
+            "i64" => match v {
+                Value::Int(i) => Value::Int64(i as i64),
+                Value::Int64(i) => Value::Int64(i),
+                Value::Float(f) => Value::Int64(f as i64),
+                Value::Bool(b) => Value::Int64(if b { 1 } else { 0 }),
+                _ => self.panic_at(ln, 1, "类型转换失败：不能转 i64"),
+            },
+            "float" | "f64" | "double" => match v {
+                Value::Int(i) => Value::Float(i as f64),
+                Value::Int64(i) => Value::Float(i as f64),
+                Value::Float(f) => Value::Float(f),
+                Value::Bool(b) => Value::Float(if b { 1.0 } else { 0.0 }),
+                _ => self.panic_at(ln, 1, "类型转换失败：不能转 float"),
+            },
+            "str" | "string" => Value::String(PoolStr::new(&fmt_value(&v))),
+            "bool" => Value::Bool(v.is_truthy()),
+            "void" => v,
+            _ => self.panic_at(ln, 1, &format!("未知类型: {}", ty)),
+        }
+    }
+
     fn eval_expr(&mut self, expr: &Expr) -> Value {
         match expr {
+            Expr::Cast(inner, ty, ln) => self.eval_cast(inner, ty, *ln),
+            Expr::Int64(n, _) => Value::Int64(*n),
             Expr::Match(subject, arms, ln) => {
                 let sv = self.eval_expr(subject);
                 for (pat, body) in arms {
@@ -5184,8 +5711,13 @@ impl Interpreter {
                 let rv = self.eval_expr(r);
                 let rg = match (lv, rv) {
                     (Value::Int(a), Value::Int(b)) => (a as f64, b as f64),
+                    (Value::Int64(a), Value::Int64(b)) => (a as f64, b as f64),
+                    (Value::Int64(a), Value::Int(b)) => (a as f64, b as f64),
+                    (Value::Int(a), Value::Int64(b)) => (a as f64, b as f64),
                     (Value::Int(a), Value::Float(b)) => (a as f64, b),
                     (Value::Float(a), Value::Int(b)) => (a, b as f64),
+                    (Value::Int64(a), Value::Float(b)) => (a as f64, b),
+                    (Value::Float(a), Value::Int64(b)) => (a, b as f64),
                     (Value::Float(a), Value::Float(b)) => (a, b),
                     _ => self.panic_here(".. 区间端点必须是数字"),
                 };
@@ -5195,9 +5727,21 @@ impl Interpreter {
                 let val = self.eval_expr(inner);
                 match val {
                     Value::Int(n) => Value::Int(-n),
+                    Value::Int64(n) => Value::Int64(-n),
                     Value::Float(f) => Value::Float(-f),
                     _ => self.panic_here( "一元负号仅支持整数和浮点数"),
                 }
+            }
+            Expr::Not(inner, _) => {
+                let val = self.eval_expr(inner);
+                let t = match val {
+                    Value::Bool(b) => b,
+                    Value::Int(n) => n != 0,
+                    Value::Float(f) => f != 0.0,
+                    Value::String(x) => !x.as_str().is_empty(),
+                    _ => true, // 其余值视为非空真
+                };
+                Value::Bool(!t)
             }
             Expr::Member(e, member, ln) => {
                 let v = self.eval_expr(e);
@@ -5483,6 +6027,7 @@ impl Interpreter {
 
                                 let var_str = match inner_val {
                                     Value::Int(n) => n.to_string(),
+                                    Value::Int64(n) => n.to_string(),
                                     Value::Float(f) => f.to_string(),
                                     Value::String(s) => s.as_str().to_string(),
                                     Value::Bool(b) => b.to_string(),
@@ -5493,6 +6038,7 @@ impl Interpreter {
                                             if idx > 0 { arr_s.push_str(", "); }
                                             match item {
                                                 Value::Int(n) => arr_s.push_str(&n.to_string()),
+                                                Value::Int64(n) => arr_s.push_str(&n.to_string()),
                                                 Value::Float(f) => arr_s.push_str(&f.to_string()),
                                                 Value::String(st) => arr_s.push_str(st.as_str()),
                                                 Value::Bool(b) => arr_s.push_str(&b.to_string()),
@@ -5505,6 +6051,7 @@ impl Interpreter {
                                                 Value::Instance(i) => arr_s.push_str(&format!("(instance of {})", i.borrow().class.name)),
                                                 Value::Closure(_) => arr_s.push_str("(closure)"),
                                                 Value::Dict(map) => arr_s.push_str(&fmt_value(&Value::Dict(map.clone()))),
+                                                Value::Generator(_) => arr_s.push_str("(generator)"),
                                             }
                                         }
                                         arr_s.push(']');
@@ -5517,6 +6064,7 @@ impl Interpreter {
                                     Value::Class(c) => format!("(class {})", c.name),
                                     Value::Instance(i) => format!("(instance of {})", i.borrow().class.name),
         Value::Closure(_) => "(closure)".to_string(),
+        Value::Generator(_) => "(generator)".to_string(),
                                 };
                                 res.push_str(&var_str);
                             }
@@ -5684,7 +6232,8 @@ impl Interpreter {
                 let l = self.eval_expr(lhs);
                 let r = self.eval_expr(rhs);
 
-                // 仅左操作数明确为数组安全指针才执行数组原地运算
+                // 仅左操作数为数组安全指针且为四则运算才执行数组原地运算
+                if matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div) {
                 if let Value::ArrayElementPtr(arr_name, idx) = &l {
                     // 读取数组当前原值
                     let origin = self.array_get_index(arr_name, *idx);
@@ -5706,10 +6255,13 @@ impl Interpreter {
                     self.array_set_index(&arr_name, *idx, res.clone());
                     return res;
                 }
+                }
 
                 // ========== 下面原有全部代码完全不动 ==========
                 if l.is_arena_ptr() || l.is_raw_ptr() || r.is_arena_ptr() || r.is_raw_ptr() {
-                    self.panic_at(*op_line, 1, "运行时错误：指针禁止参与算术运算");
+                    if !matches!(op, Op::Equal | Op::Neq) {
+                        self.panic_at(*op_line, 1, "运行时错误：指针禁止参与算术运算（仅支持 == / !=）");
+                    }
                 }
 
                 match (l, r) {
@@ -5725,6 +6277,86 @@ impl Interpreter {
                         Op::Le => Value::Int(if a <= b { 1 } else { 0 }),
                         Op::Equal => Value::Bool(a == b),
                         Op::Neq => Value::Bool(a != b),
+                        Op::And => unreachable!(),
+                        Op::Or => unreachable!(),
+                        Op::RelCmp => unreachable!(),
+                    },
+                    (Value::Int64(a), Value::Int64(b)) => match op {
+                        Op::Add => Value::Int64(a + b),
+                        Op::Sub => Value::Int64(a - b),
+                        Op::Mul => Value::Int64(a * b),
+                        Op::Div => Value::Int64(a / b),
+                        Op::Mod => Value::Int64(a % b),
+                        Op::Gt => Value::Int(if a > b { 1 } else { 0 }),
+                        Op::Lt => Value::Int(if a < b { 1 } else { 0 }),
+                        Op::Ge => Value::Int(if a >= b { 1 } else { 0 }),
+                        Op::Le => Value::Int(if a <= b { 1 } else { 0 }),
+                        Op::Equal => Value::Bool(a == b),
+                        Op::Neq => Value::Bool(a != b),
+                        Op::And => unreachable!(),
+                        Op::Or => unreachable!(),
+                        Op::RelCmp => unreachable!(),
+                    },
+                    (Value::Int64(a), Value::Int(b)) => match op {
+                        Op::Add => Value::Int64(a + b as i64),
+                        Op::Sub => Value::Int64(a - b as i64),
+                        Op::Mul => Value::Int64(a * b as i64),
+                        Op::Div => Value::Int64(a / b as i64),
+                        Op::Mod => Value::Int64(a % b as i64),
+                        Op::Gt => Value::Int(if a > b as i64 { 1 } else { 0 }),
+                        Op::Lt => Value::Int(if a < b as i64 { 1 } else { 0 }),
+                        Op::Ge => Value::Int(if a >= b as i64 { 1 } else { 0 }),
+                        Op::Le => Value::Int(if a <= b as i64 { 1 } else { 0 }),
+                        Op::Equal => Value::Bool(a == b as i64),
+                        Op::Neq => Value::Bool(a != b as i64),
+                        Op::And => unreachable!(),
+                        Op::Or => unreachable!(),
+                        Op::RelCmp => unreachable!(),
+                    },
+                    (Value::Int(a), Value::Int64(b)) => match op {
+                        Op::Add => Value::Int64(a as i64 + b),
+                        Op::Sub => Value::Int64(a as i64 - b),
+                        Op::Mul => Value::Int64(a as i64 * b),
+                        Op::Div => Value::Int64(a as i64 / b),
+                        Op::Mod => Value::Int64(a as i64 % b),
+                        Op::Gt => Value::Int(if (a as i64) > b { 1 } else { 0 }),
+                        Op::Lt => Value::Int(if (a as i64) < b { 1 } else { 0 }),
+                        Op::Ge => Value::Int(if (a as i64) >= b { 1 } else { 0 }),
+                        Op::Le => Value::Int(if (a as i64) <= b { 1 } else { 0 }),
+                        Op::Equal => Value::Bool((a as i64) == b),
+                        Op::Neq => Value::Bool((a as i64) != b),
+                        Op::And => unreachable!(),
+                        Op::Or => unreachable!(),
+                        Op::RelCmp => unreachable!(),
+                    },
+                    (Value::Int64(a), Value::Float(b)) => match op {
+                        Op::Add => Value::Float((a as f64) + b),
+                        Op::Sub => Value::Float((a as f64) - b),
+                        Op::Mul => Value::Float((a as f64) * b),
+                        Op::Div => Value::Float((a as f64) / b),
+                        Op::Mod => Value::Float((a as f64) % b),
+                        Op::Gt => Value::Int(if (a as f64) > b { 1 } else { 0 }),
+                        Op::Lt => Value::Int(if (a as f64) < b { 1 } else { 0 }),
+                        Op::Ge => Value::Int(if (a as f64) >= b { 1 } else { 0 }),
+                        Op::Le => Value::Int(if (a as f64) <= b { 1 } else { 0 }),
+                        Op::Equal => Value::Bool((a as f64) == b),
+                        Op::Neq => Value::Bool((a as f64) != b),
+                        Op::And => unreachable!(),
+                        Op::Or => unreachable!(),
+                        Op::RelCmp => unreachable!(),
+                    },
+                    (Value::Float(a), Value::Int64(b)) => match op {
+                        Op::Add => Value::Float(a + (b as f64)),
+                        Op::Sub => Value::Float(a - (b as f64)),
+                        Op::Mul => Value::Float(a * (b as f64)),
+                        Op::Div => Value::Float(a / (b as f64)),
+                        Op::Mod => Value::Float(a % (b as f64)),
+                        Op::Gt => Value::Int(if a > (b as f64) { 1 } else { 0 }),
+                        Op::Lt => Value::Int(if a < (b as f64) { 1 } else { 0 }),
+                        Op::Ge => Value::Int(if a >= (b as f64) { 1 } else { 0 }),
+                        Op::Le => Value::Int(if a <= (b as f64) { 1 } else { 0 }),
+                        Op::Equal => Value::Bool(a == (b as f64)),
+                        Op::Neq => Value::Bool(a != (b as f64)),
                         Op::And => unreachable!(),
                         Op::Or => unreachable!(),
                         Op::RelCmp => unreachable!(),
@@ -5792,6 +6424,7 @@ impl Interpreter {
                     (Value::String(a), b) | (b, Value::String(a)) if matches!(op, Op::Add) => {
                         let b_str = match b {
                             Value::Int(n) => PoolStr::new(&n.to_string()),
+                            Value::Int64(n) => PoolStr::new(&n.to_string()),
                             Value::Float(f) => PoolStr::new(&f.to_string()),
                             Value::Bool(bl) => PoolStr::new(&bl.to_string()),
                             Value::String(s) => s,
@@ -5803,6 +6436,7 @@ impl Interpreter {
                             Value::Class(c) => PoolStr::new(&format!("(class {})", c.name)),
                             Value::Instance(i) => PoolStr::new(&format!("(instance of {})", i.borrow().class.name)),
                             Value::Closure(_) => PoolStr::new("(closure)"),
+                            Value::Generator(_) => PoolStr::new("(generator)"),
                             Value::Dict(map) => PoolStr::new(&fmt_value(&Value::Dict(map))),
                         };
                         Value::String(PoolStr::concat(&a, &b_str))
@@ -5814,6 +6448,15 @@ impl Interpreter {
                         Op::And => Value::Bool(a && b),
                         _ => Value::Int(0),
                     },
+                    // 指针比较：== / !=（ArenaPtr/RawPtr 比地址，ArrayElementPtr 比名+下标）
+                    (a, b) if matches!(a, Value::ArenaPtr(_) | Value::RawPtr(_) | Value::ArrayElementPtr(..))
+                        || matches!(b, Value::ArenaPtr(_) | Value::RawPtr(_) | Value::ArrayElementPtr(..)) => {
+                        match op {
+                            Op::Equal => Value::Bool(ptr_value_equal(&a, &b)),
+                            Op::Neq => Value::Bool(!ptr_value_equal(&a, &b)),
+                            _ => self.panic_here("指针仅支持 == / != 比较"),
+                        }
+                    }
                     // 不同类型之间 == / != 直接返回 false
                     (_, _) => match op {
                         Op::Equal => Value::Bool(false),
@@ -5866,6 +6509,7 @@ impl Interpreter {
                     fn print_val_no_lf(v: &Value) {
                         match v {
                             Value::Int(n) => print!("{}", n),
+                            Value::Int64(n) => print!("{}", n),
                             Value::Float(f) => print!("{}", f),
                             Value::String(s) => print!("{}", s.as_str()),
                             Value::Bool(b) => print!("{}", b),
@@ -5884,6 +6528,7 @@ impl Interpreter {
                             Value::Class(class_rc) => print!("(class {})", class_rc.name),
                             Value::Instance(inst) => print!("(instance of {})", inst.borrow().class.name),
                             Value::Closure(_) => print!("(closure)"),
+                        Value::Generator(_) => print!("(generator)"),
                             Value::Dict(map) => {
                                 print!("{{");
                                 let mut first = true;
@@ -5926,6 +6571,15 @@ impl Interpreter {
                     };
                     return Value::Int(len as i32);
                 }
+                if func_name == "now" {
+                    if !args.is_empty() {
+                        panic!("now 不接受参数");
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    return Value::Float(now.as_micros() as f64);
+                }
 
                 let mut evaluated_args = Vec::new();
                 for a in args {
@@ -5938,7 +6592,7 @@ impl Interpreter {
                 #[cfg(feature = "gui")]
                 {
                     // GUI 函数（脚本调用 gui_* 才初始化窗口）；仅裸调用生效
-                    if all_parts.len() == 1 && (func_name == "gui_window" || func_name == "gui_button" || func_name == "gui_text" || func_name == "gui_heading" || func_name == "gui_separator" || func_name == "gui_spacer" || func_name == "gui_input" || func_name == "gui_input_var" || func_name == "gui_textarea" || func_name == "gui_output" || func_name == "gui_terminal" || func_name == "gui_checkbox" || func_name == "gui_slider" || func_name == "gui_row" || func_name == "gui_col" || func_name == "gui_topbar" || func_name == "gui_topbar_v" || func_name == "gui_sidebar" || func_name == "gui_bottombar" || func_name == "gui_run" || func_name == "gui_color_edit" || func_name == "gui_combo" || func_name == "gui_radio" || func_name == "gui_table" || func_name == "gui_multiselect" || func_name == "gui_tabs" || func_name == "gui_canvas" || func_name == "canvas_line" || func_name == "canvas_rect" || func_name == "canvas_circle") {
+                    if all_parts.len() == 1 && (func_name == "gui_window" || func_name == "gui_icon" || func_name == "gui_button" || func_name == "gui_text" || func_name == "gui_heading" || func_name == "gui_separator" || func_name == "gui_spacer" || func_name == "gui_input" || func_name == "gui_input_var" || func_name == "gui_textarea" || func_name == "gui_output" || func_name == "gui_terminal" || func_name == "gui_checkbox" || func_name == "gui_slider" || func_name == "gui_row" || func_name == "gui_col" || func_name == "gui_topbar" || func_name == "gui_topbar_v" || func_name == "gui_sidebar" || func_name == "gui_bottombar" || func_name == "gui_run" || func_name == "gui_color_edit" || func_name == "gui_combo" || func_name == "gui_radio" || func_name == "gui_table" || func_name == "gui_multiselect" || func_name == "gui_tabs" || func_name == "gui_canvas" || func_name == "canvas_line" || func_name == "canvas_rect" || func_name == "canvas_circle") {
                         return self.call_gui(&func_name, evaluated_args, *ln);
                     }
                 }
@@ -5953,6 +6607,20 @@ impl Interpreter {
                 if let Some(&lib_fn) = self.lib_funcs.get(&func_name) {
                     return self.call_builtin(lib_fn, evaluated_args);
                 }
+                // 类静态方法：mymod.Person.hello() → real_full = 模块::类::方法
+                if let Some(ci) = real_full.rfind("::") {
+                    let (cls_path, meth) = real_full.split_at(ci);
+                    let meth = &meth[2..];
+                    if let Some(class_def) = self.classes.get(cls_path).cloned() {
+                        let class_rc = Rc::new(class_def);
+                        if let Some(func) = self.find_static(&class_rc, interner().get(meth)) {
+                            if func.params.len() != evaluated_args.len() {
+                                self.panic_at(*ln, 1, &format!("静态方法 {} 参数数量不匹配", real_full));
+                            }
+                            return self.call_func(func, evaluated_args);
+                        }
+                    }
+                }
                 // 类实例化：类名作为函数调用，如 Person("Tom", 18)
                 if let Some(class_def) = self.classes.get(&real_full).cloned() {
                     return self.instantiate(class_def, evaluated_args, *ln);
@@ -5965,11 +6633,22 @@ impl Interpreter {
                 }
                 let func = self.funcs.get(&real_full)
                     .cloned()
-                    .unwrap_or_else(|| self.panic_here( &format!("函数或类不存在: {}", real_full)));
+                    .unwrap_or_else(|| self.panic_at(*ln, 1, &format!("函数或类不存在: {}", real_full)));
 
                 self.call_func(func, evaluated_args)
             }
             Expr::MethodCall(obj_expr, method_name, args, ln) => {
+                // 模块点号调用兼容：os.getcwd(...) → 查 lib_funcs 里 os::getcwd；先于对象求值
+                if let Expr::Ident(name, _) = &**obj_expr {
+                    let full = format!("{}::{}", interner().lookup(*name), interner().lookup(*method_name));
+                    if let Some(&lib_fn) = self.lib_funcs.get(&full) {
+                        let mut evaluated_args = Vec::new();
+                        for a in args {
+                            evaluated_args.push(self.eval_expr(a));
+                        }
+                        return self.call_builtin(lib_fn, evaluated_args);
+                    }
+                }
                 let obj = self.eval_expr(obj_expr);
                 let mut evaluated_args = Vec::new();
                 for a in args {
@@ -5993,6 +6672,17 @@ impl Interpreter {
                         let (func, decl_class) = self.find_method(&class_rc, mname)
                             .unwrap_or_else(|| self.panic_at(*ln, 1, &format!("实例没有方法 {}", interner().lookup(mname))));
                         self.call_func_with_self(func, Value::Instance(inst_rc.clone()), evaluated_args, *ln, Some(decl_class))
+                    }
+                    // 生成器：g.next() 推进到下一个 yield（done 后返回哨兵 0）
+                    Value::Generator(g) => {
+                        if *method_name == interner().get("next") {
+                            match self.generator_next_val(g) {
+                                Some(v) => v,
+                                None => Value::Int(0),
+                            }
+                        } else {
+                            self.panic_at(*ln, 1, &format!("生成器没有方法 {}", interner().lookup(*method_name)));
+                        }
                     }
                     _ => self.panic_at(*ln, 1, &format!("对象没有方法 {}", interner().lookup(*method_name))),
                 }
@@ -6121,6 +6811,88 @@ impl Interpreter {
 // ==============================
 // 库加载 & 导入解析
 // ==============================
+// ============ std 标准库目录机制 ============
+/// exe 所在目录下的 std 标准库根目录（xlang.exe / xlang_gui.exe 同级）
+static STD_ROOT: OnceLock<PathBuf> = OnceLock::new();
+fn std_root_dir() -> PathBuf {
+    STD_ROOT.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("std")
+    }).clone()
+}
+
+/// 加载一个 std 模块目录：init.x 必须最先，其余 .x 按名序合并为一个模块
+fn load_std_dir_module(interp: &mut Interpreter, dir: &PathBuf, module_path: &str) {
+    if !dir.join("init.x").exists() {
+        script_panic("", 0, &format!("导入失败：模块目录 {} 缺少 init.x", dir.display()));
+    }
+    // 收集目录下所有 .x，init.x 必须第一个，其余按名称序
+    let mut files: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".x"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    if let Some(pos) = files.iter().position(|f| f == "init.x") {
+        files.remove(pos);
+        files.insert(0, "init.x".to_string());
+    }
+
+    let mut entry = ModuleCacheEntry { exports: Vec::new(), initialized: false };
+    // 每个 .x 文件（除 init.x）额外建立一个子命名空间模块：std::math::<file>
+    let mut sub_entries: Vec<(String, Vec<ModuleExportItem>)> = Vec::new();
+    for f in files {
+        let fp = dir.join(&f);
+        let content = match std::fs::read_to_string(&fp) {
+            Ok(c) => c,
+            Err(_) => script_panic("", 0, &format!("导入失败：无法读取标准库文件 {}", fp.display())),
+        };
+        let tokenizer = Tokenizer::new(&content);
+        let mut parser = Parser::new(tokenizer);
+        let stmts = parser.parse_program();
+        let mut sub = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::FnDef(name, params, body, _ret, line) => {
+                    entry.exports.push(ModuleExportItem::Fn(name.clone(), params.clone(), body.clone(), line));
+                    if f != "init.x" { sub.push(ModuleExportItem::Fn(name, params, body, line)); }
+                }
+                Stmt::Let(name, expr, line) => {
+                    let n = interner().lookup(name);
+                    entry.exports.push(ModuleExportItem::Let(n.clone(), expr.clone(), line));
+                    if f != "init.x" { sub.push(ModuleExportItem::Let(n, expr, line)); }
+                }
+                Stmt::Const(name, expr, line) => {
+                    let n = interner().lookup(name);
+                    entry.exports.push(ModuleExportItem::Const(n.clone(), expr.clone(), line));
+                    if f != "init.x" { sub.push(ModuleExportItem::Const(n, expr, line)); }
+                }
+                Stmt::Class(def, line) => {
+                    entry.exports.push(ModuleExportItem::Class(def.name.clone(), def.clone(), line));
+                    if f != "init.x" { sub.push(ModuleExportItem::Class(def.name.clone(), def, line)); }
+                }
+                _ => {}
+            }
+        }
+        if f != "init.x" && !sub.is_empty() {
+            let base = f.trim_end_matches(".x").to_string();
+            sub_entries.push((base, sub));
+        }
+    }
+    interp.module_cache.insert(module_path.to_string(), entry);
+    for (base, sub) in sub_entries {
+        let sp = format!("{}::{}", module_path, base);
+        if !interp.module_cache.contains_key(&sp) {
+            interp.module_cache.insert(sp, ModuleCacheEntry { exports: sub, initialized: false });
+        }
+    }
+}
+
 fn load_xlang_module(interp: &mut Interpreter, file_path: &str, module_path: &str) {
     // 如果已经缓存，直接返回，不再重复读取解析
     if interp.module_cache.contains_key(module_path) {
@@ -6143,7 +6915,7 @@ fn load_xlang_module(interp: &mut Interpreter, file_path: &str, module_path: &st
 
     for stmt in stmts {
         match stmt {
-            Stmt::FnDef(name, params, body, line) => {
+            Stmt::FnDef(name, params, body, _ret, line) => {
                 entry.exports.push(ModuleExportItem::Fn(name, params, body, line));
             }
             Stmt::Let(name, expr, line) => {
@@ -6153,6 +6925,10 @@ fn load_xlang_module(interp: &mut Interpreter, file_path: &str, module_path: &st
             Stmt::Const(name, expr, line) => {
                 // 仅顶层const，加入模块导出
                 entry.exports.push(ModuleExportItem::Const(interner().lookup(name), expr, line));
+            }
+            Stmt::Class(def, line) => {
+                // 类导出：注册为 模块路径::类名
+                entry.exports.push(ModuleExportItem::Class(def.name.clone(), def, line));
             }
             // 其他语句（if/while/import等）模块顶层直接忽略，不执行
             _ => {}
@@ -6180,7 +6956,7 @@ fn init_module(interp: &mut Interpreter, module_path: &str) {
             ModuleExportItem::Fn(name, params, body, _line) => {
                 // 注册函数：模块路径::函数名
                 let full_name = format!("{}::{}", module_path, name);
-                interp.funcs.insert(full_name, Func{params, body});
+                interp.funcs.insert(full_name.clone(), Func { name: full_name, line: 0, params, body, ret_ty: None });
             }
             ModuleExportItem::Let(var_name, expr, _line) => {
                 // 变量名字：模块路径::变量名
@@ -6193,6 +6969,19 @@ fn init_module(interp: &mut Interpreter, module_path: &str) {
                 let full_var = format!("{}::{}", module_path, var_name);
                 let val = interp.eval_expr(&expr);
                 interp.env.define_const(full_var, val);
+            }
+            ModuleExportItem::Class(name, mut def, _line) => {
+                // 注册为 模块路径::类名，使 mymod.Person / mymod::Person 可用
+                let full_class = format!("{}::{}", module_path, name);
+                // 父类若为同模块裸名（class A : B），重写为 模块::B
+                if let Some(sc) = def.superclass.clone() {
+                    if !sc.contains("::") {
+                        def.superclass = Some(format!("{}::{}", module_path, sc));
+                    }
+                }
+                // 类名同步重写为全名：super()/current_class 用该类名查类表才能命中
+                def.name = full_class.clone();
+                interp.classes.insert(full_class, def);
             }
         }
     }
@@ -6213,7 +7002,7 @@ fn load_lib_functions(file_path: &str) -> Vec<String> {
     let stmts = parser.parse_program();
     let mut funcs = Vec::new();
     for stmt in stmts {
-        if let Stmt::FnDef(name, _, _, _) = stmt {
+        if let Stmt::FnDef(name, _, _, _, _) = stmt {
             funcs.push(name);
         }
     }
@@ -6518,24 +7307,180 @@ fn register_os_funcs(interp: &mut Interpreter) {
     });
 }
 
-fn resolve_import(interp: &mut Interpreter, parts: &[String]) {
-    if parts.is_empty() {
+/// 路径 parts 逐段 join 到 base
+fn join_parts(base: &PathBuf, parts: &[String]) -> PathBuf {
+    let mut p = base.clone();
+    for x in parts { p = p.join(x); }
+    p
+}
+
+/// 解析并加载单个模块（无通配）。命名空间 = parts.join("::")
+fn resolve_single_module(interp: &mut Interpreter, parts: &[String]) {
+    if parts.is_empty() { return; }
+    let full = parts.join("::");
+    if interp.module_cache.contains_key(&full) {
+        init_module(interp, &full);
         return;
     }
+    // 标准库 std（显式 std 前缀）：目录模块 std/math（init.x）或单文件 std/math/x.x
+    if parts[0] == "std" {
+        let sub: Vec<String> = parts[1..].to_vec();
+        let dir = join_parts(&std_root_dir(), &sub);
+        if dir.join("init.x").exists() {
+            load_std_dir_module(interp, &dir, &full);
+            std_alias(interp, &full);
+            init_module(interp, &full);
+            init_std_alias(interp, &full);
+            init_std_submodules(interp, &full);
+            return;
+        }
+        let file = dir.with_extension("x");
+        if Path::new(&file).exists() {
+            load_xlang_module(interp, &file.to_string_lossy(), &full);
+            std_alias(interp, &full);
+            init_module(interp, &full);
+            init_std_alias(interp, &full);
+            return;
+        }
+        script_panic("", 0, &format!("导入失败：std 标准库中不存在模块 {}", full));
+    }
+    // lib 目录兼容（旧 import lib.os / "lib::os"）
+    if parts[0] == "lib" {
+        let file = path_to_file_path(parts);
+        load_xlang_module(interp, &file, &full);
+        init_module(interp, &full);
+        return;
+    }
+    // 其他（无 std 前缀）：std 优先，std 无此模块再走自定义路径
+    let dir = join_parts(&std_root_dir(), parts);
+    if dir.join("init.x").exists() {
+        load_std_dir_module(interp, &dir, &full);
+        init_module(interp, &full);
+        return;
+    }
+    let file = path_to_file_path(parts);
+    load_xlang_module(interp, &file, &full);
+    init_module(interp, &full);
+}
 
-    let full_mod_path = parts.join("::");
-    let file_path = path_to_file_path(parts);
+/// 无前缀别名：把 std::math 的模块 entry 克隆到 math（使 math::add 与 math.add 均可用）。
+/// 必须在 init_module 之前调用，否则 exports 已被 drain 为空。
+fn std_alias(interp: &mut Interpreter, full: &str) {
+    if let Some(al) = full.strip_prefix("std::") {
+        if !interp.module_cache.contains_key(al) {
+            let e = interp.module_cache.get(full).unwrap().clone();
+            interp.module_cache.insert(al.to_string(), e);
+        }
+    }
+}
 
-    // 第一步加载模块（解析AST存入缓存，不执行）
-    load_xlang_module(interp, &file_path, &full_mod_path);
-    // 第二步：初始化模块，执行顶层let/const，注册函数
-    init_module(interp, &full_mod_path);
+/// 初始化无前缀别名模块（std::math 已 init 后，对其别名 math 执行 init）
+fn init_std_alias(interp: &mut Interpreter, full: &str) {
+    if let Some(al) = full.strip_prefix("std::") {
+        init_module(interp, al);
+    }
+}
+
+/// 初始化 std 目录模块的子命名空间（std::math::<file>），使 std.math.complex.cmod 等可访问
+fn init_std_submodules(interp: &mut Interpreter, full: &str) {
+    let prefix = format!("{}::", full);
+    let depth = full.matches("::").count();
+    let keys: Vec<String> = interp.module_cache.keys()
+        .filter(|k| k.starts_with(&prefix) && k.matches("::").count() == depth + 1)
+        .cloned().collect();
+    for k in keys {
+        init_module(interp, &k);
+    }
+}
+
+/// 通配导入：把该目录本身作为模块合并加载（含 init.x 与全部 .x），再导入其子模块目录。
+/// 例如 std.* → std 下所有顶层模块；std.math.* → std/math 合并为一个模块（std::math）。
+fn resolve_wildcard(interp: &mut Interpreter, dir_parts: &[String]) {
+    let base = if dir_parts.first().map(|x| x.as_str()) == Some("std") {
+        join_parts(&std_root_dir(), &dir_parts[1..])
+    } else if dir_parts.first().map(|x| x.as_str()) == Some("lib") {
+        PathBuf::from(dir_parts.join("\\"))
+    } else {
+        join_parts(&std_root_dir(), dir_parts)
+    };
+    // 本目录是模块（含 init.x）：合并加载，命名空间 = dir_parts.join("::")
+    if base.join("init.x").exists() {
+        resolve_single_module(interp, dir_parts);
+    }
+    // 再导入子模块目录
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for e in rd.filter_map(|x| x.ok()) {
+            let path = e.path();
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs.sort();
+    for p in dirs {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        let mut np = dir_parts.to_vec();
+        np.push(name);
+        resolve_single_module(interp, &np);
+    }
+}
+
+/// 命名导入：import mod.{a, b}; 加载 mod 后，把列出的符号复制到当前命名空间（无前缀直接可用）
+fn resolve_named_import(interp: &mut Interpreter, parts: &[String], names: &[String]) {
+    if parts.is_empty() { return; }
+    if parts.iter().any(|x| x == "*") { script_panic("", 0, "命名导入不能与通配 * 混用"); }
+    resolve_single_module(interp, parts);
+    let full = parts.join("::");
+    // 命名空间基：std 模块额外考虑无前缀别名（std::math -> math）
+    let mut bases = vec![full.clone()];
+    if let Some(al) = full.strip_prefix("std::") { bases.push(al.to_string()); }
+    for sym in names {
+        let mut found = false;
+        for base in &bases {
+            let key = format!("{}::{}", base, sym);
+            if interp.classes.contains_key(&key) {
+                if !interp.classes.contains_key(sym) {
+                    let c = interp.classes.get(&key).unwrap().clone();
+                    interp.classes.insert(sym.to_string(), c);
+                }
+                found = true; break;
+            }
+            if interp.funcs.contains_key(&key) {
+                if !interp.funcs.contains_key(sym) {
+                    let f = interp.funcs.get(&key).unwrap().clone();
+                    interp.funcs.insert(sym.to_string(), f);
+                }
+                found = true; break;
+            }
+            if interp.env.contains(&key) {
+                if !interp.env.contains(sym) {
+                    let v = interp.env.get(&key);
+                    interp.env.define_var(sym.to_string(), v);
+                }
+                found = true; break;
+            }
+        }
+        if !found { script_panic("", 0, &format!("命名导入失败：模块 {} 中不存在符号 {}", full, sym)); }
+    }
+}
+
+fn resolve_import(interp: &mut Interpreter, parts: &[String]) {
+    if parts.is_empty() { return; }
+    // 通配（*）：展开为多个单模块导入
+    if let Some(wp) = parts.iter().position(|x| x == "*") {
+        resolve_wildcard(interp, &parts[..wp]);
+        return;
+    }
+    resolve_single_module(interp, parts);
 }
 
 /// 递归检查表达式，返回表达式类型 + 静态校验报错
 fn check_expr(expr: &Expr, env: &mut TypeEnv, file: &str, line: u32) -> Type {
     match expr {
         Expr::Number(_, ln) => Type::Int,
+        Expr::Int64(_, _ln) => Type::Int,
+        Expr::Cast(e, _, _ln) => check_expr(e, env, file, line),
         Expr::Float(_, ln) => Type::Float,
         Expr::String(_, ln) | Expr::RawString(_, ln) => Type::String,
         Expr::Bool(_, ln) => Type::Bool,
@@ -6744,6 +7689,10 @@ fn check_expr(expr: &Expr, env: &mut TypeEnv, file: &str, line: u32) -> Type {
             }
             ty
         }
+        Expr::Not(inner, _) => {
+            let _ = check_expr(inner, env, file, 0);
+            Type::Bool
+        }
     }
 }
 
@@ -6751,6 +7700,7 @@ fn check_expr(expr: &Expr, env: &mut TypeEnv, file: &str, line: u32) -> Type {
 fn check_stmt(stmt: &Stmt, env: &mut TypeEnv, file: &str) {
     match stmt {
         Stmt::Break(ln) | Stmt::Continue(ln) => {}
+        Stmt::Yield(expr, ln) => { let _ = check_expr(expr, env, file, *ln); }
         Stmt::Let(name, expr, ln) => {
             let ty = check_expr(expr, env, file, *ln);
             env.define_id(*name, ty);
@@ -6803,7 +7753,7 @@ fn check_stmt(stmt: &Stmt, env: &mut TypeEnv, file: &str) {
                 check_stmt(s, env, file);
             }
         }
-        Stmt::FnDef(_name, params, body, ln) => {
+        Stmt::FnDef(_name, params, body, _ret, ln) => {
             let mut inner_env = TypeEnv::nested(env.clone());
             // 把函数所有形参注册到函数局部静态环境
             for param in params {
@@ -6813,7 +7763,7 @@ fn check_stmt(stmt: &Stmt, env: &mut TypeEnv, file: &str) {
                 check_stmt(s, &mut inner_env, file);
             }
         }
-        Stmt::ImportItem { lib_path: _, parts, alias, import_all: _, line: _ } => {}
+        Stmt::ImportItem { lib_path: _, parts, alias, import_all: _, names: _, line: _ } => {}
         Stmt::Class(def, ln) => {
             // 构造函数
             if let Some(ctor) = &def.constructor {
@@ -6892,6 +7842,18 @@ fn script_panic_at(file: &str, line: u32, col: u32, msg: &str) -> ! {
         line,
         col,
         msg: msg.to_string(),
+        secondary: Vec::new(),
+    })
+}
+
+/// 带附加定位的错误入口：主标签 + 多个根源/连带标签
+fn script_panic_at_multi(file: &str, line: u32, col: u32, msg: &str, secondary: Vec<(u32, u32, String)>) -> ! {
+    std::panic::panic_any(ScriptError {
+        file: file.to_string(),
+        line,
+        col,
+        msg: msg.to_string(),
+        secondary,
     })
 }
 
@@ -6986,6 +7948,17 @@ fn render_script_error(err: &ScriptError, code: Option<&str>) {
             .with_color(Color::Red)
             .with_message(err.msg.clone()),
     );
+    // 附加定位：根源/连带位置渲染为黄色次要标签
+    for (sln, scl, smsg) in &err.secondary {
+        let s_start = line_col_to_char_idx(src, *sln, *scl).unwrap_or(0);
+        let mut s_end = s_start;
+        while s_end < chars.len() && chars[s_end] != '\n' { s_end += 1; }
+        builder = builder.with_label(
+            Label::new((file_name.clone(), s_start..s_end))
+                .with_color(Color::Yellow)
+                .with_message(smsg.clone()),
+        );
+    }
 
     let report = builder.finish();
     // 非终端（输出被捕获/管道）时全局禁用 ANSI 颜色，避免 \x1b[31m 乱码
@@ -7144,6 +8117,17 @@ fn extract_run_call(trim: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// 用常驻解释器求值一个 run() 参数表达式，返回其 Value
+/// 指针相等：ArenaPtr/RawPtr 比地址值；ArrayElementPtr 比"名+下标"；其余组合不相等
+fn ptr_value_equal(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (ArenaPtr(x), ArenaPtr(y)) | (ArenaPtr(x), RawPtr(y)) | (RawPtr(x), ArenaPtr(y)) => x == y,
+        (RawPtr(x), RawPtr(y)) => x == y,
+        (ArrayElementPtr(n1, i1), ArrayElementPtr(n2, i2)) => n1 == n2 && i1 == i2,
+        _ => false,
+    }
+}
+
 fn eval_repl_arg(interp: &mut Interpreter, text: &str) -> Result<Value, String> {
     let t = Tokenizer::new(text);
     let mut p = Parser::new(t);
@@ -7179,6 +8163,15 @@ fn repl_run_file(fname: &str, interp: &mut Interpreter, show_time: bool, arg_exp
     let mut p = Parser::new(t);
     p.file = fname.to_string();
     let ast = p.parse_program();
+    // 每次 run 独立执行：清空跨 run 累积的文件级状态（类定义/字段布局缓存/模块缓存/异常栈），
+    // 避免 REPL 中反复 run 同一文件导致类字段布局或模块缓存污染（"实例没有字段 X"）
+    interp.classes.clear();
+    interp.field_cache.clear();
+    interp.module_cache.clear();
+    interp.ctx_stack.clear();
+    interp.pending_throw = None;
+    interp.current_class = None;
+    interp.current_self = None;
     let old_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7264,6 +8257,7 @@ fn is_code_complete(src: &str) -> bool {
 fn print_repl_val(v: &Value) {
     match v {
         Value::Int(n) => println!("{}", n),
+        Value::Int64(n) => println!("{}", n),
         Value::Float(f) => println!("{}", f),
         Value::String(s) => println!("{}", s.as_str()),
         Value::Bool(b) => println!("{}", b),
@@ -7282,6 +8276,7 @@ fn print_repl_val(v: &Value) {
         Value::Class(class_rc) => println!("(class {})", class_rc.name),
         Value::Instance(inst) => println!("(instance of {})", inst.borrow().class.name),
         Value::Closure(_) => println!("(closure)"),
+        Value::Generator(_) => println!("(generator)"),
         Value::Dict(map) => {
             print!("{{");
             let mut first = true;

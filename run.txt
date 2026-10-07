@@ -1,0 +1,3 @@
+cargo build --release --workspace   :: 两个都编（xlang.exe + xlang_gui.exe）
+cargo build --release               :: 只编 xlang.exe（在根目录默认只编当前包）
+cargo build --release -p xlang-gui  :: 只编 xlang_gui.exe

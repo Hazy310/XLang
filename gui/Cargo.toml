@@ -23,6 +23,8 @@ ahash = "0.8"
 mimalloc = "0.1"
 yansi = "1"
 
+png = "0.17"
+
 [dependencies.eframe]
 version = "0.31"
 default-features = false
